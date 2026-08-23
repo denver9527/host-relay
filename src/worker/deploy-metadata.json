@@ -1,0 +1,12 @@
+{
+  "main_module": "worker.js",
+  "compatibility_date": "2026-05-18",
+  "bindings": [
+    { "type": "durable_object_namespace", "name": "HUB", "class_name": "Hub" },
+    { "type": "durable_object_namespace", "name": "HOST", "class_name": "Host" }
+  ],
+  "migrations": {
+    "tag": "v1",
+    "new_sqlite_classes": ["Hub", "Host"]
+  }
+}

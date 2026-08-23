@@ -3,6 +3,14 @@
 name = "host-relay"
 main = "worker.js"
 compatibility_date = "2026-05-18"
+account_id = "41fd851aaccb6cb70f2cb9135265d5f9"
+
+# 测试部署目标: cld2 账户 (cgq7139@139.com), zone hi315.us.ci
+workers_dev = true
+zone_name = "hi315.us.ci"
+routes = [
+  { pattern = "host-relay.hi315.us.ci/*", custom_domain = false }
+]
 
 [observability]
 enabled = true

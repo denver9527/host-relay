@@ -32,15 +32,13 @@ import (
 	"github.com/shirou/gopsutil/v3/mem"
 )
 
-const version = "0.3.0"
+const version = "1.0.1"
 
 var (
 	server    = flag.String("server", "", "服务端地址,如 wss://host-relay.example.com(必填)")
 	hostID    = flag.String("id", "", "面板分配的主机 ID(必填)")
 	token     = flag.String("token", "", "面板生成的令牌(必填)")
 	shellPath = flag.String("shell", "", "本地 shell 路径(方案 B:agent 直接起此 shell,默认按 OS 选 /bin/bash 或 powershell)")
-	sshTarget = flag.String("ssh-target", "127.0.0.1:22", "已废弃(方案 B 不再 dial sshd),仅保留兼容")
-	sshKey    = flag.String("ssh-key", "", "已废弃(方案 B 不再做 SSH 认证),仅保留兼容")
 	interval  = flag.Duration("interval", 30*time.Second, "状态上报间隔")
 	diskPath  = flag.String("disk-path", defaultDiskPath(), "磁盘用量统计路径")
 	logFile   = flag.String("log", "", "指定日志文件路径,不指定则默认不保存日志文件")

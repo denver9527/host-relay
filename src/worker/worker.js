@@ -8,17 +8,17 @@ import { DurableObject } from 'cloudflare:workers';
 // 各平台客户端下载地址(自行替换为你发布的二进制地址,不替换则可以用这个默认的)。
 const CLIENT_URL = {
   linux: {
-    "agent-linux-amd64": "https://github.com/denver9527/host-relay/releases/download/v1.0.0/agent-linux-amd64",
-    "agent-linux-arm64": "https://github.com/denver9527/host-relay/releases/download/v1.0.0/agent-linux-arm64",
-    "agent-linux-386": "https://github.com/denver9527/host-relay/releases/download/v1.0.0/agent-linux-386",
-    "agent-linux-arm": "https://github.com/denver9527/host-relay/releases/download/v1.0.0/agent-linux-arm"
+    "agent-linux-amd64": "https://github.com/denver9527/host-relay/releases/download/v1.0.1/agent-linux-amd64",
+    "agent-linux-arm64": "https://github.com/denver9527/host-relay/releases/download/v1.0.1/agent-linux-arm64",
+    "agent-linux-386": "https://github.com/denver9527/host-relay/releases/download/v1.0.1/agent-linux-386",
+    "agent-linux-arm": "https://github.com/denver9527/host-relay/releases/download/v1.0.1/agent-linux-arm"
   },
   mac: {
-    "agent-darwin-amd64": "https://github.com/denver9527/host-relay/releases/download/v1.0.0/agent-darwin-amd64",
-    "agent-darwin-arm64": "https://github.com/denver9527/host-relay/releases/download/v1.0.0/agent-darwin-arm64"
+    "agent-darwin-amd64": "https://github.com/denver9527/host-relay/releases/download/v1.0.1/agent-darwin-amd64",
+    "agent-darwin-arm64": "https://github.com/denver9527/host-relay/releases/download/v1.0.1/agent-darwin-arm64"
   },
   win: {
-    "agent-windows-amd64.exe": "https://github.com/denver9527/host-relay/releases/download/v1.0.0/agent-windows-amd64.exe"
+    "agent-windows-amd64.exe": "https://github.com/denver9527/host-relay/releases/download/v1.0.1/agent-windows-amd64.exe"
   }
 };
 
@@ -158,7 +158,7 @@ function hub(env) {
 }
 
 function agentCommand(host, hostId, token) {
-  return `agent --server wss://${host} --id ${hostId} --token ${token} --ssh-target 127.0.0.1:22`;
+  return `agent --server wss://${host} --id ${hostId} --token ${token}`;
 }
 
 // ============================ Worker 入口 ============================
@@ -986,7 +986,7 @@ function showEnroll(el, data){
         Object.keys(bins).forEach(function(binName) {
           var id = 'tab-' + binName.replace(/[^a-zA-Z0-9]/g, '-');
           var url = bins[binName];
-          var cmdStr = "./" + binName + " --server " + data.serverUrl + " --id " + data.hostId + " --token " + data.token + " --ssh-target 127.0.0.1:22";
+          var cmdStr = "./" + binName + " --server " + data.serverUrl + " --id " + data.hostId + " --token " + data.token;
           
           tagsHtml += '<button class="tag-btn ' + (first ? 'active' : '') + '" data-target="' + id + '">' + esc(os) + ' (' + esc(binName) + ')</button>';
           

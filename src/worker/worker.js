@@ -8,17 +8,17 @@ import { DurableObject } from 'cloudflare:workers';
 // 各平台客户端下载地址(自行替换为你发布的二进制地址,不替换则可以用这个默认的)。
 const CLIENT_URL = {
   linux: {
-    "agent-linux-amd64": "https://github.com/twofattiger/host-relay/releases/download/v1.0.0/agent-linux-amd64",
-    "agent-linux-arm64": "https://github.com/twofattiger/host-relay/releases/download/v1.0.0/agent-linux-arm64",
-    "agent-linux-386": "https://github.com/twofattiger/host-relay/releases/download/v1.0.0/agent-linux-386",
-    "agent-linux-arm": "https://github.com/twofattiger/host-relay/releases/download/v1.0.0/agent-linux-arm"
+    "agent-linux-amd64": "https://github.com/denver9527/host-relay/releases/download/v1.0.0/agent-linux-amd64",
+    "agent-linux-arm64": "https://github.com/denver9527/host-relay/releases/download/v1.0.0/agent-linux-arm64",
+    "agent-linux-386": "https://github.com/denver9527/host-relay/releases/download/v1.0.0/agent-linux-386",
+    "agent-linux-arm": "https://github.com/denver9527/host-relay/releases/download/v1.0.0/agent-linux-arm"
   },
   mac: {
-    "agent-darwin-amd64": "https://github.com/twofattiger/host-relay/releases/download/v1.0.0/agent-darwin-amd64",
-    "agent-darwin-arm64": "https://github.com/twofattiger/host-relay/releases/download/v1.0.0/agent-darwin-arm64"
+    "agent-darwin-amd64": "https://github.com/denver9527/host-relay/releases/download/v1.0.0/agent-darwin-amd64",
+    "agent-darwin-arm64": "https://github.com/denver9527/host-relay/releases/download/v1.0.0/agent-darwin-arm64"
   },
   win: {
-    "agent-windows-amd64.exe": "https://github.com/twofattiger/host-relay/releases/download/v1.0.0/agent-windows-amd64.exe"
+    "agent-windows-amd64.exe": "https://github.com/denver9527/host-relay/releases/download/v1.0.0/agent-windows-amd64.exe"
   }
 };
 
@@ -27,7 +27,7 @@ const LOGIN_MAX_FAILS  = 8;                        // 连续失败次数上限
 const LOGIN_LOCK_MS    = 15 * 60 * 1000;           // 锁定时长
 const PENDING_TTL_MS   = 24 * 60 * 60 * 1000;      // pending 主机未上线清理阈值
 const CLEANUP_EVERY_MS = 6 * 60 * 60 * 1000;       // 清理任务间隔
-const TICKET_TTL_MS    = 30 * 1000;                // SSH ticket 有效期
+const TICKET_TTL_MS    = 5 * 60 * 1000;             // SSH ticket 有效期(5 分钟,避免开页久了点连接即失效)
 const HUB_NAME = '_hub';
 
 // ============================ 工具函数 ============================
@@ -458,6 +458,7 @@ export class Hub extends DurableObject {
 export class Host extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
+    this._sshOpenTimers = {};
   }
 
   // 由 Hub 在 enroll 时种入身份
@@ -550,7 +551,9 @@ export class Host extends DurableObject {
       return;
     }
     if (msg.type === 'ssh_opened' || msg.type === 'ssh_error' || msg.type === 'ssh_close') {
-      const b = this._browserByCid(msg.channelId);
+      const cid = msg.channelId;
+      if (this._sshOpenTimers[cid]) { clearTimeout(this._sshOpenTimers[cid]); delete this._sshOpenTimers[cid]; }
+      const b = this._browserByCid(cid);
       if (b) {
         try { b.send(JSON.stringify({ type: msg.type, msg: msg.msg })); } catch {}
         if (msg.type !== 'ssh_opened') { try { b.close(1000, 'session ended'); } catch {} }
@@ -575,24 +578,24 @@ export class Host extends DurableObject {
 
     if (msg.type === 'auth') {
       if (!agent) { this._sendBrowser(ws, { type: 'ssh_error', msg: '主机离线,无法连接' }); try { ws.close(); } catch {} return; }
-      let credential = '';
-      if ((msg.authType || 'password') === 'password') {
-        credential = msg.password || '';
-        const ckey = 'cred:' + (msg.username || '');
-        if (!credential) {
-          const saved = await this.ctx.storage.get(ckey);
-          if (saved && this.env.ENC_KEY) { try { credential = await aesDecrypt(this.env.ENC_KEY, saved); } catch {} }
-          if (!credential) { this._sendBrowser(ws, { type: 'ssh_error', msg: '需要密码(无已保存密码)' }); return; }
-        } else if (msg.save && this.env.ENC_KEY) {
-          try { await this.ctx.storage.put(ckey, await aesEncrypt(this.env.ENC_KEY, credential)); } catch {}
-        }
-      }
+      // 方案 B:relay 已鉴权,agent 直接以 username 起本地 shell,无需密码/私钥
       try {
         agent.send(JSON.stringify({
           type: 'ssh_open', channelId: att.cid, username: msg.username || 'root',
-          authType: msg.authType || 'password', credential, cols: msg.cols || 80, rows: msg.rows || 24,
+          cols: msg.cols || 80, rows: msg.rows || 24,
         }));
       } catch {}
+      // 超时兜底:15s 内未收到该 channel 的 ssh_opened/ssh_error 则主动报错,消除"永久转圈"
+      const cid = att.cid;
+      clearTimeout(this._sshOpenTimers[cid]);
+      this._sshOpenTimers[cid] = setTimeout(() => {
+        const b = this._browserByCid(cid);
+        if (b) {
+          try { b.send(JSON.stringify({ type: 'ssh_error', msg: '连接超时,请检查目标主机是否就绪后重试' })); } catch {}
+          try { b.close(1000, 'ssh open timeout'); } catch {}
+        }
+        delete this._sshOpenTimers[cid];
+      }, 15000);
       return;
     }
     if (msg.type === 'resize' && agent) {
@@ -620,6 +623,7 @@ export class Host extends DurableObject {
   async webSocketClose(ws) {
     const att = ws.deserializeAttachment() || {};
     if (att.role === 'browser') {
+      if (this._sshOpenTimers[att.cid]) { clearTimeout(this._sshOpenTimers[att.cid]); delete this._sshOpenTimers[att.cid]; }
       const agent = this._agentWs();
       if (agent) { try { agent.send(JSON.stringify({ type: 'ssh_close', channelId: att.cid })); } catch {} }
       return;
@@ -1101,16 +1105,9 @@ const TERM_HTML = `<!DOCTYPE html>
 <body>
 <div id="term"></div>
 <div class="overlay" id="ov"><div class="box">
-  <h1>SSH 连接</h1>
-  <label>用户名</label>
+  <h1>终端连接</h1>
+  <label>登录用户(将以该用户身份起本地 shell)</label>
   <input type="text" id="user" value="root" autocomplete="off" spellcheck="false">
-  <label>认证方式</label>
-  <div class="seg"><button id="m-pw" class="on">密码</button><button id="m-key">私钥(主机本地)</button></div>
-  <div id="pwwrap">
-    <label>密码 <span style="color:#5b6675">(已保存可留空)</span></label>
-    <input type="password" id="pw" autocomplete="off">
-    <div class="save"><input type="checkbox" id="save"><label for="save" style="margin:0">保存密码,下次免输入</label></div>
-  </div>
   <button class="connect" id="go">连接</button>
   <div class="msg" id="msg"></div>
 </div></div>
@@ -1119,15 +1116,7 @@ const TERM_HTML = `<!DOCTYPE html>
 <script>
 "use strict";
 var ticket = decodeURIComponent((location.hash||"").slice(1));
-var authType = "password";
 var term, fit, ws, connected=false;
-
-document.getElementById("m-pw").onclick=function(){ authType="password";
-  this.classList.add("on"); document.getElementById("m-key").classList.remove("on");
-  document.getElementById("pwwrap").style.display="block"; };
-document.getElementById("m-key").onclick=function(){ authType="key";
-  this.classList.add("on"); document.getElementById("m-pw").classList.remove("on");
-  document.getElementById("pwwrap").style.display="none"; };
 
 function setMsg(t){ document.getElementById("msg").textContent=t||""; }
 function btn(){ return document.getElementById("go"); }
@@ -1163,9 +1152,6 @@ function connect(){
   ws.onopen=function(){
     ws.send(JSON.stringify({ type:"auth",
       username: document.getElementById("user").value || "root",
-      authType: authType,
-      password: document.getElementById("pw").value,
-      save: document.getElementById("save").checked,
       cols: term.cols, rows: term.rows }));
   };
   ws.onmessage=function(ev){
@@ -1179,12 +1165,14 @@ function connect(){
       term.write(new Uint8Array(ev.data));
     }
   };
-  ws.onclose=function(){ if(connected) term.write("\\r\\n\\x1b[31m[连接已断开]\\x1b[0m\\r\\n");
-    connected=false; btn().disabled=false; };
-  ws.onerror=function(){ setMsg("连接错误"); btn().disabled=false; };
+  ws.onclose=function(){
+    if(connected) term.write("\\r\\n\\x1b[31m[连接已断开]\\x1b[0m\\r\\n");
+    else setMsg("连接失败:可能连接已失效,请关闭此终端页重新打开再试");
+    connected=false; btn().disabled=false;
+  };
+  ws.onerror=function(){ setMsg("连接失败:可能连接已失效,请关闭此终端页重新打开再试"); btn().disabled=false; };
 }
 btn().onclick=connect;
-document.getElementById("pw").onkeydown=function(e){ if(e.key==="Enter") connect(); };
 document.getElementById("user").onkeydown=function(e){ if(e.key==="Enter") connect(); };
 </script>
 </body></html>`;

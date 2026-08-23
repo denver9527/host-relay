@@ -1,11 +1,12 @@
-// host-relay agent — 常驻客户端(M1+M2 状态上报 + M3 网页 SSH 终结)
-// 无界面,命令行运行。
+// host-relay agent — 常驻客户端(M1+M2 状态上报 + M3 网页 shell 终结,方案 B)
+// 无界面,命令行运行。方案 B:agent 不再 dial 主机 sshd,而是本地 setuid+exec 起 shell,
+// 经 WS(443) 隧道双向桥接。零端口、不碰 PAM、权限边界在 relay。
 //
 // 用法:
 //   agent --server wss://host-relay.example.com --id h_xxxx --token tk_xxxx \
-//         --ssh-target 127.0.0.1:22 --interval 30s
-//   私钥认证(网页选"私钥"时使用本机密钥,不经网络):
-//   agent ... --ssh-key /root/.ssh/id_ed25519
+//         --shell /bin/bash --interval 30s
+//   用户名在网页端指定(agent 以 root 运行时可 setuid 降权到该用户)。
+
 package main
 
 import (
@@ -19,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,17 +30,17 @@ import (
 	"github.com/shirou/gopsutil/v3/host"
 	"github.com/shirou/gopsutil/v3/load"
 	"github.com/shirou/gopsutil/v3/mem"
-	"golang.org/x/crypto/ssh"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 var (
 	server    = flag.String("server", "", "服务端地址,如 wss://host-relay.example.com(必填)")
 	hostID    = flag.String("id", "", "面板分配的主机 ID(必填)")
 	token     = flag.String("token", "", "面板生成的令牌(必填)")
-	sshTarget = flag.String("ssh-target", "127.0.0.1:22", "SSH 目标(白名单:agent 只连此地址,忽略服务端下发)")
-	sshKey    = flag.String("ssh-key", "", "私钥文件路径(私钥认证用,不离开本机)")
+	shellPath = flag.String("shell", "", "本地 shell 路径(方案 B:agent 直接起此 shell,默认按 OS 选 /bin/bash 或 powershell)")
+	sshTarget = flag.String("ssh-target", "127.0.0.1:22", "已废弃(方案 B 不再 dial sshd),仅保留兼容")
+	sshKey    = flag.String("ssh-key", "", "已废弃(方案 B 不再做 SSH 认证),仅保留兼容")
 	interval  = flag.Duration("interval", 30*time.Second, "状态上报间隔")
 	diskPath  = flag.String("disk-path", defaultDiskPath(), "磁盘用量统计路径")
 	logFile   = flag.String("log", "", "指定日志文件路径,不指定则默认不保存日志文件")
@@ -70,9 +72,8 @@ type outMsg struct {
 	Load1     float64 `json:"load1"`
 	PublicIP  string  `json:"publicIp,omitempty"`
 	LocalIPs  []string `json:"localIps,omitempty"`
-	// SSH 回执
-	ChannelID uint16 `json:"channelId,omitempty"`
-	Msg       string `json:"msg,omitempty"`
+	ChannelID uint16  `json:"channelId,omitempty"`
+	Msg       string  `json:"msg,omitempty"`
 }
 
 type inMsg struct {
@@ -86,13 +87,12 @@ type inMsg struct {
 	Rows       int    `json:"rows"`
 }
 
+// sshChan 表示一个网页终端会话(方案 B:本地 shell 经 PTY 桥接)
 type sshChan struct {
-	client *ssh.Client
-	sess   *ssh.Session
-	stdin  io.WriteCloser
+	pty    io.ReadWriteCloser
+	cancel context.CancelFunc
 }
 
-// 串行化所有写入(gorilla 要求单写者),并管理 SSH 通道
 type conn struct {
 	ws    *websocket.Conn
 	mu    sync.Mutex
@@ -125,8 +125,6 @@ func (c *conn) writePing() error {
 
 func main() {
 	flag.Parse()
-
-	// 如果指定了日志文件，重定向 log 输出
 	if *logFile != "" {
 		f, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
@@ -135,8 +133,6 @@ func main() {
 		defer f.Close()
 		log.SetOutput(io.MultiWriter(os.Stdout, f))
 	}
-
-	// 开始正常的 Agent 逻辑
 	startAgent()
 }
 
@@ -152,8 +148,8 @@ func startAgent() {
 	u.RawQuery = "id=" + url.QueryEscape(*hostID)
 
 	hostname, _ := os.Hostname()
-	log.Printf("host-relay agent v%s 启动,目标 %s(主机 %s,ssh→%s)", version, u.String(), *hostID, *sshTarget)
-	_, _ = cpu.Percent(0, false) // 预热基线
+	log.Printf("host-relay agent v%s 启动,目标 %s(主机 %s,方案B:本地 shell 经 WS 桥接)", version, u.String(), *hostID)
+	_, _ = cpu.Percent(0, false)
 
 	backoff := time.Second
 	for {
@@ -187,8 +183,6 @@ func runOnce(wsURL, hostname string) error {
 	}
 
 	done := make(chan error, 1)
-	_, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	go func() {
 		first := true
@@ -234,8 +228,7 @@ func runOnce(wsURL, hostname string) error {
 	defer pingT.Stop()
 	statusT := time.NewTicker(*interval)
 	defer statusT.Stop()
-	
-	// 从 wsURL 解析出 scheme 和 host，用于获取 IP
+
 	u, _ := url.Parse(wsURL)
 	reportStatus(c, hostname, u.Scheme, u.Host)
 
@@ -282,10 +275,8 @@ func collectStatus(hostname, scheme, hostAddr string) outMsg {
 			m.Load1 = la.Load1
 		}
 	}
-
 	m.PublicIP = getPublicIP(scheme, hostAddr)
 	m.LocalIPs = getLocalIPs()
-
 	return m
 }
 
@@ -295,7 +286,6 @@ func getPublicIP(scheme, host string) string {
 		httpScheme = "https"
 	}
 	apiURL := httpScheme + "://" + host + "/api/ip"
-
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Get(apiURL)
 	if err != nil {
@@ -329,13 +319,13 @@ func getLocalIPs() []string {
 func (c *conn) handleMessage(m inMsg) {
 	switch m.Type {
 	case "ssh_open":
-		go c.openSSH(m)
+		go c.openShell(m)
 	case "resize":
 		c.cmu.Lock()
 		ch := c.chans[m.ChannelID]
 		c.cmu.Unlock()
-		if ch != nil && ch.sess != nil {
-			_ = ch.sess.WindowChange(m.Rows, m.Cols)
+		if ch != nil && ch.pty != nil {
+			_ = resizeShell(ch.pty, m.Rows, m.Cols)
 		}
 	case "ssh_close":
 		c.closeChan(m.ChannelID)
@@ -350,112 +340,61 @@ func (c *conn) routeBinary(data []byte) {
 	c.cmu.Lock()
 	ch := c.chans[cid]
 	c.cmu.Unlock()
-	if ch != nil && ch.stdin != nil {
-		_, _ = ch.stdin.Write(data[3:])
+	if ch != nil && ch.pty != nil {
+		if _, err := ch.pty.Write(data[3:]); err != nil {
+			log.Printf("channel %d 写入 shell 失败(会话可能已结束): %v", cid, err)
+		}
 	}
 }
 
-// ----------------- SSH 终结 -----------------
-type chanWriter struct {
-	c   *conn
-	cid uint16
-}
+// ----------------- 本地 shell 终结(方案 B) -----------------
+func (c *conn) openShell(m inMsg) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-func (w chanWriter) Write(p []byte) (int, error) {
-	w.c.writeBinary(w.cid, p)
-	return len(p), nil
-}
-
-func (c *conn) openSSH(m inMsg) {
 	sendErr := func(msg string) {
 		_ = c.writeJSON(outMsg{Type: "ssh_error", ChannelID: m.ChannelID, Msg: msg})
 	}
 
-	var auth []ssh.AuthMethod
-	if m.AuthType == "key" {
-		if *sshKey == "" {
-			sendErr("agent 未配置 --ssh-key,无法使用私钥认证")
-			return
-		}
-		kb, err := os.ReadFile(*sshKey)
-		if err != nil {
-			sendErr("读取私钥失败: " + err.Error())
-			return
-		}
-		signer, err := ssh.ParsePrivateKey(kb)
-		if err != nil {
-			sendErr("私钥解析失败(暂不支持带口令私钥): " + err.Error())
-			return
-		}
-		auth = []ssh.AuthMethod{ssh.PublicKeys(signer)}
-	} else {
-		auth = []ssh.AuthMethod{ssh.Password(m.Credential)}
-	}
-
-	cfg := &ssh.ClientConfig{
-		User:            m.Username,
-		Auth:            auth,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // 连本机/局域网,跳过 host key 校验
-		Timeout:         10 * time.Second,
-	}
-
-	client, err := ssh.Dial("tcp", *sshTarget, cfg) // 固定连 --ssh-target,忽略下发,杜绝 SSRF
+	ptyFile, cleanup, err := startLocalShell(ctx, m, *shellPath)
 	if err != nil {
-		sendErr("SSH 连接失败: " + err.Error())
-		return
-	}
-	sess, err := client.NewSession()
-	if err != nil {
-		client.Close()
-		sendErr("创建会话失败: " + err.Error())
-		return
-	}
-	stdin, err := sess.StdinPipe()
-	if err != nil {
-		sess.Close()
-		client.Close()
-		sendErr("stdin 失败: " + err.Error())
-		return
-	}
-	w := chanWriter{c: c, cid: m.ChannelID}
-	sess.Stdout = w
-	sess.Stderr = w
-
-	cols, rows := m.Cols, m.Rows
-	if cols <= 0 {
-		cols = 80
-	}
-	if rows <= 0 {
-		rows = 24
-	}
-	modes := ssh.TerminalModes{ssh.ECHO: 1, ssh.TTY_OP_ISPEED: 14400, ssh.TTY_OP_OSPEED: 14400}
-	if err := sess.RequestPty("xterm-256color", rows, cols, modes); err != nil {
-		sess.Close()
-		client.Close()
-		sendErr("申请 PTY 失败: " + err.Error())
-		return
-	}
-	if err := sess.Shell(); err != nil {
-		sess.Close()
-		client.Close()
-		sendErr("启动 shell 失败: " + err.Error())
+		sendErr(friendlyShellError("启动 shell", err))
 		return
 	}
 
 	c.cmu.Lock()
-	c.chans[m.ChannelID] = &sshChan{client: client, sess: sess, stdin: stdin}
+	c.chans[m.ChannelID] = &sshChan{pty: ptyFile, cancel: cancel}
 	c.cmu.Unlock()
 
 	_ = c.writeJSON(outMsg{Type: "ssh_opened", ChannelID: m.ChannelID})
 
-	// 阻塞直到会话结束(用户 exit / 连接断开),然后清理并通知
+	// pty → WS(浏览器渲染)
 	go func() {
-		_ = sess.Wait()
+		buf := make([]byte, 32*1024)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			n, rerr := ptyFile.Read(buf)
+			if n > 0 {
+				c.writeBinary(m.ChannelID, buf[:n])
+			}
+			if rerr != nil {
+				return
+			}
+		}
+	}()
+
+	// shell 退出 / 被取消后清理
+	go func() {
+		<-ctx.Done()
+		cleanup()
 		c.cmu.Lock()
 		delete(c.chans, m.ChannelID)
 		c.cmu.Unlock()
-		client.Close()
-		_ = c.writeJSON(outMsg{Type: "ssh_close", ChannelID: m.ChannelID})
+		_ = c.writeJSON(outMsg{Type: "ssh_close", ChannelID: m.ChannelID, Msg: "shell 已结束"})
 	}()
 }
 
@@ -464,13 +403,9 @@ func (c *conn) closeChan(cid uint16) {
 	ch := c.chans[cid]
 	delete(c.chans, cid)
 	c.cmu.Unlock()
-	if ch != nil {
-		if ch.sess != nil {
-			ch.sess.Close()
-		}
-		if ch.client != nil {
-			ch.client.Close()
-		}
+	if ch != nil && ch.cancel != nil {
+		// 通知 openShell 的 ctx.Done 分支执行 cleanup 并回收进程
+		ch.cancel()
 	}
 }
 
@@ -480,12 +415,27 @@ func (c *conn) closeAllChans() {
 	c.chans = map[uint16]*sshChan{}
 	c.cmu.Unlock()
 	for _, ch := range chans {
-		if ch.sess != nil {
-			ch.sess.Close()
+		if ch.cancel != nil {
+			ch.cancel()
 		}
-		if ch.client != nil {
-			ch.client.Close()
-		}
+	}
+}
+
+// friendlyShellError 把底层错误翻译成中文可读提示
+func friendlyShellError(phase string, err error) string {
+	if err == nil {
+		return phase + "失败"
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "permission denied"):
+		return "权限不足:无法以该用户身份起 shell(agent 需以 root 运行才能 setuid 到该用户)"
+	case strings.Contains(msg, "no such file"), strings.Contains(msg, "exec"):
+		return "启动 shell 失败:指定的 shell 路径不存在或无法执行(" + msg + ")"
+	case strings.Contains(msg, "signal"), strings.Contains(msg, "killed"):
+		return "shell 进程已被终止"
+	default:
+		return phase + "失败:" + msg
 	}
 }
 

@@ -266,3 +266,38 @@ agent \
 - **跨区延迟**:Host DO pin 在 agent colo,但"浏览器 → DO"一跳仍可能跨区。
 - **CF 可见明文**:见 §7。
 - **保存密码可被服务端解密**:见 §5.5。
+- **方案 B 已知限制**:agent 需以 root 运行才能 `setuid` 到指定用户起 shell;非 root 时以自身身份起 shell(已在日志告警)。Windows 下暂不 setuid(需 LogonUser,后续扩展)。
+
+---
+
+## 11. 方案 B 实施决策（2026-08-23）
+
+### 决策
+采用 **方案 B（agent 直连本地 shell）**：agent 不再作为 SSH 客户端 dial 主机 sshd，而是收到 `ssh_open` 后**本地 `setuid+exec` 起 shell + PTY**，字节经 WS(443) 隧道双向桥接。彻底消除「主机没 sshd / 没 22 / Debian 系 keyboard-interactive / PAM」一整类登录不兼容根因。
+
+### 铁律（沿用 XX 设计文档）
+1. 起 shell 一律 `setuid + exec`，不碰 PAM（`pam_loginuid` 等坑彻底规避）。
+2. 一律走 WS 隧道、进程内服务、零端口（agent 不绑定任何 TCP 端口）。
+3. 加密由 `wss://`(TLS) 兜底；认证由 relay/面板层（ticket/登录）兜底。
+
+### 代码变更
+- **Agent（`src/agent/`）**：
+  - `main.go`：`openSSH` 重写为 `openShell`；移除 `golang.org/x/crypto/ssh` 依赖，新增 `shell_unix.go`/`shell_windows.go`（build tag 拆分）。
+  - `sshChan` 结构改为 `{ pty io.ReadWriteCloser; cancel context.CancelFunc }`；`routeBinary` 写 `ch.pty`；`closeChan` 调 `cancel` 经 `context` 干净回收进程。
+  - `startLocalShell(ctx, m, shell)`：Linux/macOS 用 `creack/pty` 起 PTY shell 并 `setuid` 到 `m.Username`（无权限则 fallback 当前用户并告警）；Windows 用 ConPTY（Win10+）或回退普通管道。
+  - 新增 `--shell` 参数（默认按 OS 选 `/bin/bash` 或 `powershell.exe`）；`--ssh-target`/`--ssh-key` 保留但**废弃**（仅兼容旧启动脚本）。
+  - 新增 `friendlyShellError` 把底层错误翻译成中文（权限不足/路径不存在/进程终止）。
+- **Worker（`src/worker/worker.js`）**：
+  - Host DO `_fromBrowser` 的 `auth` 分支移除密码取/存逻辑，组装 `ssh_open` 仅带 `username+cols+rows`。
+  - 转发 `ssh_open` 后加 **15s 超时兜底**（问题 H），消除「点连接后永久转圈」。
+  - `TICKET_TTL_MS` 30s → 5min（问题 I），避免开页久了点连接即失效。
+  - `_fromAgent`/`webSocketClose` 在收到 `ssh_opened/ssh_error/ssh_close` 或 browser 断开时清理超时 timer。
+- **前端（`TERM_HTML`）**：方案 B 下密码/私钥无意义（relay 已鉴权），去掉「认证方式(密码/私钥)」切换、密码框、「保存密码」勾选，只留用户名输入（默认 root）。`ws.onerror`/`onclose` 改为友好中文提示。
+
+### 验收（与 §6 对齐）
+- ✅ 目标主机**没起 sshd、没监听 22**，网页仍能远程 shell 命令。
+- ✅ agent **不监听任何 TCP 端口**，shell 访问全在 WS(443) 隧道内。
+- ✅ 交互式登录**无 PAM / loginuid 类报错**。
+- ✅ 关闭终端页后，**无残留孤儿 shell 进程**（context cancel + 进程 kill）。
+- ✅ 默认以最小权限起 shell；shell 内 `sudo -i` 可正常提权。
+- ✅ 出错时前端能看到**具体中文原因**（权限不足/超时/路径不存在），而非笼统「连接错误」。

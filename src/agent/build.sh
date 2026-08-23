@@ -32,7 +32,7 @@ platforms=(
 for platform in "${platforms[@]}"; do
     read -r GOOS GOARCH OUTPUT_NAME <<< "$platform"
     echo "正在编译 $GOOS/$GOARCH -> $OUT_DIR/$OUTPUT_NAME ..."
-    env GOOS=$GOOS GOARCH=$GOARCH go build -trimpath -ldflags="-s -w" -o "$OUT_DIR/$OUTPUT_NAME" main.go
+    env GOOS=$GOOS GOARCH=$GOARCH go build -trimpath -ldflags="-s -w" -o "$OUT_DIR/$OUTPUT_NAME" .
     if [ $? -ne 0 ]; then
         echo "❌ 编译失败: $GOOS/$GOARCH"
         exit 1

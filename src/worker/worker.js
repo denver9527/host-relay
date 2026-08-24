@@ -556,7 +556,8 @@ export class Host extends DurableObject {
       const b = this._browserByCid(cid);
       if (b) {
         try { b.send(JSON.stringify({ type: msg.type, msg: msg.msg })); } catch {}
-        if (msg.type !== 'ssh_opened') { try { b.close(1000, 'session ended'); } catch {} }
+        // 不再主动 close 浏览器 WS;关闭由 webSocketClose(浏览器自身 onclose)统一处理,
+        // 避免 agent 正常起 shell 后 worker 抢关导致页面秒显"会话已结束"。
       }
       return;
     }
@@ -592,7 +593,7 @@ export class Host extends DurableObject {
         const b = this._browserByCid(cid);
         if (b) {
           try { b.send(JSON.stringify({ type: 'ssh_error', msg: '连接超时,请检查目标主机是否就绪后重试' })); } catch {}
-          try { b.close(1000, 'ssh open timeout'); } catch {}
+          // 不主动 close 浏览器 WS;让浏览器自行处理或走 webSocketClose,避免误杀已建立的 shell 会话。
         }
         delete this._sshOpenTimers[cid];
       }, 15000);

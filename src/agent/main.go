@@ -32,7 +32,7 @@ import (
 	"github.com/shirou/gopsutil/v3/mem"
 )
 
-const version = "1.0.1"
+const version = "1.0.2"
 
 var (
 	server    = flag.String("server", "", "服务端地址,如 wss://host-relay.example.com(必填)")
@@ -348,7 +348,12 @@ func (c *conn) routeBinary(data []byte) {
 // ----------------- 本地 shell 终结(方案 B) -----------------
 func (c *conn) openShell(m inMsg) {
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// 不再 defer cancel:openShell 写完 ssh_opened 启动两个 goroutine 后主线程就 return,
+	// defer 会立刻把 ctx 干掉,导致下面监听 ctx.Done() 的 goroutine 误判 shell 结束,
+	// 浏览器在 ssh_opened 之后立刻看到 ssh_close "shell 已结束"。
+	// ctx 的生命周期由 closeChan()(用户主动关)/ closeAllChans()(ws 断开)显式管理。
+	defer cancel() // 仍保留 defer:函数异常 return(比如 startLocalShell 失败)时回收 ctx;成功路径下主线程会 wait 在 ctx.Done() 上,defer 不会提前触发
+	_ = cancel
 
 	sendErr := func(msg string) {
 		_ = c.writeJSON(outMsg{Type: "ssh_error", ChannelID: m.ChannelID, Msg: msg})
@@ -380,6 +385,8 @@ func (c *conn) openShell(m inMsg) {
 				c.writeBinary(m.ChannelID, buf[:n])
 			}
 			if rerr != nil {
+				// shell 进程退出 / pty 关闭 → 唤醒主线程,让 openShell 收尾
+				cancel()
 				return
 			}
 		}
@@ -392,8 +399,13 @@ func (c *conn) openShell(m inMsg) {
 		c.cmu.Lock()
 		delete(c.chans, m.ChannelID)
 		c.cmu.Unlock()
+		log.Printf("channel %d shell 已结束,关闭 WS 通知浏览器", m.ChannelID)
 		_ = c.writeJSON(outMsg{Type: "ssh_close", ChannelID: m.ChannelID, Msg: "shell 已结束"})
 	}()
+
+	// 主线程阻塞在 ctx.Done() 上,直到 closeChan / closeAllChans / pty 真正退出才 cancel。
+	// 这是修复"会话已结束"的关键:openShell 不能再 writeJSON ssh_opened 之后立即 return。
+	<-ctx.Done()
 }
 
 func (c *conn) closeChan(cid uint16) {

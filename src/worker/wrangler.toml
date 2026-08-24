@@ -9,7 +9,8 @@ account_id = "41fd851aaccb6cb70f2cb9135265d5f9"
 workers_dev = true
 zone_name = "hi315.us.ci"
 routes = [
-  { pattern = "host-relay.hi315.us.ci/*", custom_domain = false }
+  { pattern = "host-relay.hi315.us.ci/*", custom_domain = false },
+  { pattern = "con.hi315.us.ci/*", custom_domain = false }
 ]
 
 [observability]

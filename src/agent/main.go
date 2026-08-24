@@ -32,7 +32,7 @@ import (
 	"github.com/shirou/gopsutil/v3/mem"
 )
 
-const version = "1.0.2"
+const version = "1.0.3"
 
 var (
 	server    = flag.String("server", "", "服务端地址,如 wss://host-relay.example.com(必填)")
@@ -278,7 +278,19 @@ func collectStatus(hostname, scheme, hostAddr string) outMsg {
 	return m
 }
 
+var (
+	publicIPCache string
+	publicIPAt    time.Time
+	publicIPMu    sync.Mutex
+)
+
 func getPublicIP(scheme, host string) string {
+	publicIPMu.Lock()
+	defer publicIPMu.Unlock()
+	// 缓存 5 分钟:状态每 30s 上报一次,避免每次上报都阻塞在 /api/ip 请求上
+	if publicIPCache != "" && time.Since(publicIPAt) < 5*time.Minute {
+		return publicIPCache
+	}
 	httpScheme := "http"
 	if scheme == "wss" || scheme == "https" {
 		httpScheme = "https"
@@ -287,12 +299,14 @@ func getPublicIP(scheme, host string) string {
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Get(apiURL)
 	if err != nil {
-		return ""
+		return "" // 失败不写缓存,下次上报再试
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == 200 {
 		ip, _ := io.ReadAll(resp.Body)
-		return string(ip)
+		publicIPCache = string(ip)
+		publicIPAt = time.Now()
+		return publicIPCache
 	}
 	return ""
 }

@@ -9,7 +9,6 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"runtime"
 
 	"github.com/creack/pty"
 )
@@ -86,9 +85,6 @@ func (p *pipeRW) Close() error {
 }
 
 func defaultShell() string {
-	if runtime.GOOS != "windows" {
-		return "powershell.exe"
-	}
 	for _, s := range []string{"powershell.exe", "cmd.exe"} {
 		if _, err := os.Stat(s); err == nil {
 			return s

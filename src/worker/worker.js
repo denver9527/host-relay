@@ -8,17 +8,17 @@ import { DurableObject } from 'cloudflare:workers';
 // 各平台客户端下载地址(自行替换为你发布的二进制地址,不替换则可以用这个默认的)。
 const CLIENT_URL = {
   linux: {
-    "agent-linux-amd64": "https://github.com/denver9527/host-relay/releases/download/v1.0.1/agent-linux-amd64",
-    "agent-linux-arm64": "https://github.com/denver9527/host-relay/releases/download/v1.0.1/agent-linux-arm64",
-    "agent-linux-386": "https://github.com/denver9527/host-relay/releases/download/v1.0.1/agent-linux-386",
-    "agent-linux-arm": "https://github.com/denver9527/host-relay/releases/download/v1.0.1/agent-linux-arm"
+    "agent-linux-amd64": "https://github.com/denver9527/host-relay/releases/download/v1.0.3/agent-linux-amd64",
+    "agent-linux-arm64": "https://github.com/denver9527/host-relay/releases/download/v1.0.3/agent-linux-arm64",
+    "agent-linux-386": "https://github.com/denver9527/host-relay/releases/download/v1.0.3/agent-linux-386",
+    "agent-linux-arm": "https://github.com/denver9527/host-relay/releases/download/v1.0.3/agent-linux-arm"
   },
   mac: {
-    "agent-darwin-amd64": "https://github.com/denver9527/host-relay/releases/download/v1.0.1/agent-darwin-amd64",
-    "agent-darwin-arm64": "https://github.com/denver9527/host-relay/releases/download/v1.0.1/agent-darwin-arm64"
+    "agent-darwin-amd64": "https://github.com/denver9527/host-relay/releases/download/v1.0.3/agent-darwin-amd64",
+    "agent-darwin-arm64": "https://github.com/denver9527/host-relay/releases/download/v1.0.3/agent-darwin-arm64"
   },
   win: {
-    "agent-windows-amd64.exe": "https://github.com/denver9527/host-relay/releases/download/v1.0.1/agent-windows-amd64.exe"
+    "agent-windows-amd64.exe": "https://github.com/denver9527/host-relay/releases/download/v1.0.3/agent-windows-amd64.exe"
   }
 };
 
@@ -107,23 +107,6 @@ function randomCid() {
   const a = new Uint8Array(2);
   crypto.getRandomValues(a);
   return ((a[0] << 8) | a[1]) || 1;
-}
-
-async function aesKeyFrom(secret) {
-  const raw = await crypto.subtle.digest('SHA-256', enc.encode(secret));
-  return crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
-}
-async function aesEncrypt(secret, plaintext) {
-  const key = await aesKeyFrom(secret);
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, enc.encode(plaintext));
-  return b64url.enc(iv) + '.' + b64url.enc(ct);
-}
-async function aesDecrypt(secret, blob) {
-  const [ivb, ctb] = blob.split('.');
-  const key = await aesKeyFrom(secret);
-  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64url.dec(ivb) }, key, b64url.dec(ctb));
-  return new TextDecoder().decode(pt);
 }
 
 function parseCookies(req) {
@@ -493,7 +476,9 @@ export class Host extends DurableObject {
       if (!obj || obj.h !== myId) return new Response('bad ticket', { status: 401 });
       const nkey = 'nonce:' + obj.n;
       if (await this.ctx.storage.get(nkey)) return new Response('ticket replay', { status: 401 });
-      await this.ctx.storage.put(nkey, obj.exp); // 一次性
+      // 一次性:写入后该 nonce 即失效;附带过期,避免 DO 存储无限增长
+      const nonceTtl = Math.max(120, Math.ceil((obj.exp - Date.now()) / 1000) + 120);
+      await this.ctx.storage.put(nkey, obj.exp, { expirationTtl: nonceTtl });
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
       server.serializeAttachment({ role: 'browser', cid: randomCid() });
@@ -579,6 +564,8 @@ export class Host extends DurableObject {
 
     if (msg.type === 'auth') {
       if (!agent) { this._sendBrowser(ws, { type: 'ssh_error', msg: '主机离线,无法连接' }); try { ws.close(); } catch {} return; }
+      // 幂等:同一 cid 已有进行中的 ssh_open(定时器在跑)则忽略重复 auth,避免重复 open 覆盖 channel 造成孤儿 shell
+      if (this._sshOpenTimers[att.cid]) return;
       // 方案 B:relay 已鉴权,agent 直接以 username 起本地 shell,无需密码/私钥
       try {
         agent.send(JSON.stringify({

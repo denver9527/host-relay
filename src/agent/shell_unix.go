@@ -25,17 +25,20 @@ func startLocalShell(ctx context.Context, m inMsg, shell string) (io.ReadWriteCl
 		shell = defaultShell()
 	}
 	cmd := exec.CommandContext(ctx, shell, "-i")
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	baseEnv := []string{"TERM=xterm-256color"}
 
-	if uid, gid, ok := lookupUser(m.Username); ok {
+	if uid, gid, home, ok := lookupUser(m.Username); ok {
 		cmd.SysProcAttr = &syscall.SysProcAttr{
 			Credential: &syscall.Credential{Uid: uid, Gid: gid},
 			Setsid:     true,
 		}
-		log.Printf("以用户 %s(uid=%d) 起本地 shell: %s", m.Username, uid, shell)
+		// 降权后注入目标用户的 HOME/USER/SHELL,避免以目标用户身份却读到 /root 的 dotfiles(Permission denied)
+		baseEnv = append(baseEnv, "HOME="+home, "USER="+m.Username, "SHELL="+shell)
+		log.Printf("以用户 %s(uid=%d,home=%s) 起本地 shell: %s", m.Username, uid, home, shell)
 	} else {
 		log.Printf("未解析到用户 %s,以当前进程身份起 shell: %s", m.Username, shell)
 	}
+	cmd.Env = baseEnv
 
 	rows, cols := m.Rows, m.Cols
 	if rows <= 0 {
@@ -71,20 +74,24 @@ func defaultShell() string {
 	return "/bin/sh"
 }
 
-func lookupUser(name string) (uint32, uint32, bool) {
+func lookupUser(name string) (uint32, uint32, string, bool) {
 	if name == "" {
-		return 0, 0, false
+		return 0, 0, "", false
 	}
 	u, err := user.Lookup(name)
 	if err != nil {
-		return 0, 0, false
+		return 0, 0, "", false
 	}
 	uid, err1 := strconv.ParseUint(u.Uid, 10, 32)
 	gid, err2 := strconv.ParseUint(u.Gid, 10, 32)
 	if err1 != nil || err2 != nil {
-		return 0, 0, false
+		return 0, 0, "", false
 	}
-	return uint32(uid), uint32(gid), true
+	home := u.HomeDir
+	if home == "" {
+		home = "/"
+	}
+	return uint32(uid), uint32(gid), home, true
 }
 
 func resizeShell(f io.ReadWriteCloser, rows, cols int) error {

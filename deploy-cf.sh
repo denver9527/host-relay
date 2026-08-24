@@ -17,8 +17,8 @@
 #   - 用官方 wrangler 上传 worker.js (自动带 DO 绑定 HUB/HOST + migration v1),
 #     这是本账户新版 API (api-version 2026-09-25) 下唯一可靠的上传方式;
 #     手写 curl multipart 会被 CF 当成「传统 Service Worker」报 10021。
-#   - 自动生成并写入 4 个 Secret: ADMIN_PASSWORD(随机, 存到 E:/host_relay_adminpw.txt)
-#     / SESSION_SECRET / TICKET_KEY / ENC_KEY
+#   - 自动生成并写入 3 个 Secret: ADMIN_PASSWORD(随机, 存到 E:/host_relay_adminpw.txt)
+#     / SESSION_SECRET / TICKET_KEY
 #   - 在 hi315.us.ci 建 Worker 路由; workers.dev 子域
 #     host-relay.cgq7139-41f.workers.dev 部署后自动可用, 无需 DNS。
 set -euo pipefail
@@ -53,8 +53,7 @@ echo "==> 设置 4 个 Secret ..."
 ADMIN_PW=$(head -c 12 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16)
 SESSION_SECRET=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
 TICKET_KEY=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
-ENC_KEY=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
-for kv in "ADMIN_PASSWORD:$ADMIN_PW" "SESSION_SECRET:$SESSION_SECRET" "TICKET_KEY:$TICKET_KEY" "ENC_KEY:$ENC_KEY"; do
+for kv in "ADMIN_PASSWORD:$ADMIN_PW" "SESSION_SECRET:$SESSION_SECRET" "TICKET_KEY:$TICKET_KEY"; do
   name=${kv%%:*}; val=${kv#*:}
   echo -n "$val" | "$NODE_BIN" "$WRANGLER" secret put "$name" --config "$WCONF" 2>&1 | tail -2
 done

@@ -296,6 +296,16 @@ export default {
           return json({ ok: true });
         }
 
+        if (path === '/api/rename' && request.method === 'POST') {
+          const body = await request.json().catch(() => ({}));
+          const updated = await hub(env).rename(
+            (body.hostId || '').toString(),
+            (body.displayName || '').toString()
+          );
+          if (!updated) return json({ error: '主机不存在或名称无效' }, { status: 400 });
+          return json({ ok: true, host: updated });
+        }
+
         if (path === '/api/ticket' && request.method === 'POST') {
           if (!env.TICKET_KEY) return json({ error: '服务端未配置 TICKET_KEY' }, { status: 500 });
           const body = await request.json().catch(() => ({}));
@@ -546,6 +556,16 @@ export class Hub extends DurableObject {
     // 广播 token 已更新(虽卡片不显示 token,但为将来扩展预留)
     this._broadcastHost(hostId);
     return { hostId, token };
+  }
+
+  async rename(hostId, displayName) {
+    const h = this._getHost(hostId);
+    if (!h) return null;
+    const name = (displayName || '').toString().trim().slice(0, 64);
+    if (!name) return null;
+    this.sql.exec('UPDATE hosts SET displayName = ? WHERE hostId = ?', name, hostId);
+    this._broadcastHost(hostId);
+    return this._view({ ...h, displayName: name });
   }
 
   async deleteHost(hostId) {
@@ -920,6 +940,12 @@ const PAGE_HTML = `<!DOCTYPE html>
   .card.online::before{background:var(--signal)}
   .card.offline::before{background:var(--muted)}
   .card .name{font-weight:600;font-size:15px;display:flex;align-items:center;gap:8px}
+  .card .name.editable{cursor:pointer;border-radius:4px;padding:1px 4px;margin:-1px -4px;transition:background .15s}
+  .card .name.editable:hover{background:var(--panel-2)}
+  .card .name.editable .edit-icon{opacity:.28;transition:opacity .15s;color:var(--muted);width:12px;height:12px;flex:none;margin-left:2px}
+  .card .name.editable:hover .edit-icon{opacity:.75}
+  .card .name .nm-input{font:inherit;font-weight:600;color:inherit;background:var(--panel-2);border:1px solid var(--line);border-radius:4px;padding:1px 5px;outline:none;min-width:60px;max-width:100%}
+  .card .name .nm-input:focus{border-color:var(--signal)}
   .dot{width:8px;height:8px;border-radius:50%;background:var(--muted);flex:none}
   .card.online .dot{background:var(--green);box-shadow:0 0 0 0 rgba(63,214,122,.6);animation:pulse 2s infinite}
   @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(63,214,122,.5)}70%{box-shadow:0 0 0 6px rgba(63,214,122,0)}100%{box-shadow:0 0 0 0 rgba(63,214,122,0)}}
@@ -1169,7 +1195,11 @@ function cardHtml(h){
   var on = h.state==="active";
   var s = h.status||{};
   var head =
-    '<div class="name"><span class="dot"></span>'+esc(h.displayName)+'</div>'+
+    '<div class="name editable" data-hostid="'+esc(h.hostId)+'" title="点击修改名称">'+
+      '<span class="dot"></span>'+
+      '<span class="nm">'+esc(h.displayName)+'</span>'+
+      '<svg class="edit-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>'+
+    '</div>'+
     '<div class="meta">'+esc(h.os||"-")+(s.hostname?' · '+esc(s.hostname):'')+' · '+esc(h.hostId)+'</div>';
   var body;
   if(on && h.status){
@@ -1497,6 +1527,64 @@ function connectWS(){
   };
   ws.onclose=function(){ setTimeout(function(){ if(document.getElementById("list")) connectWS(); }, 3000); };
 }
+
+// ---------------- 主机名可编辑(点击卡片标题即可改名) ----------------
+function enterEditName(nameEl){
+  if(nameEl.dataset.editing === "1") return;
+  nameEl.dataset.editing = "1";
+  var hostId = nameEl.dataset.hostid;
+  var cur = nameEl.querySelector(".nm").textContent;
+  var nm = nameEl.querySelector(".nm");
+  var icon = nameEl.querySelector(".edit-icon");
+  var input = document.createElement("input");
+  input.className = "nm-input";
+  input.type = "text";
+  input.maxLength = 64;
+  input.value = cur;
+  nm.style.display = "none";
+  if(icon) icon.style.display = "none";
+  nameEl.appendChild(input);
+  input.focus();
+  input.select();
+  var done = false;
+  function finish(save){
+    if(done) return; done = true;
+    var v = (input.value || "").trim().slice(0, 64);
+    nameEl.dataset.editing = "0";
+    if(input.parentNode) input.remove();
+    nm.style.display = "";
+    if(icon) icon.style.display = "";
+    if(!v || v === cur){ nm.textContent = cur; return; }   // 空 / 未变 → 还原
+    if(!save){ nm.textContent = cur; return; }              // Esc → 还原
+    nm.textContent = v;  // 乐观更新
+    api("/api/rename", {hostId: hostId, displayName: v}).then(function(r){
+      var ok = !!(r && r.body && r.body.ok);
+      if(!ok){
+        nm.textContent = cur;
+        var msg = (r && r.body && r.body.error) || (r && r.body && r.body.message) || ("保存失败(HTTP "+(r&&r.status)+")");
+        alert(msg);
+      }
+    }).catch(function(){
+      nm.textContent = cur;
+      alert("网络错误");
+    });
+  }
+  input.addEventListener("keydown", function(ev){
+    if(ev.key === "Enter"){ ev.preventDefault(); finish(true); }
+    else if(ev.key === "Escape"){ ev.preventDefault(); finish(false); }
+  });
+  input.addEventListener("blur", function(){
+    // 异步让 keydown(Enter→finish(true)) 先执行完,避免 blur 把 done=true 的请求二次回调
+    setTimeout(function(){ if(!done) finish(true); }, 0);
+  });
+}
+// 全局委托:点击 .name.editable 进入编辑(脚本只跑一次,无需重复绑定)
+document.addEventListener("click", function(e){
+  var t = e.target.closest(".name.editable");
+  if(!t || t.dataset.editing === "1") return;
+  e.stopPropagation();
+  enterEditName(t);
+});
 
 // ---------------- 启动 ----------------
 function boot(){

@@ -5,29 +5,32 @@
 import { DurableObject } from 'cloudflare:workers';
 
 // ============================ 配置 ============================
+const VERSION = '1.0.5'; // 当前版本,CLIENT_URL 由此动态构建
+
 // 各平台客户端下载地址(自行替换为你发布的二进制地址,不替换则可以用这个默认的)。
 const CLIENT_URL = {
   linux: {
-    "agent-linux-amd64": "https://github.com/denver9527/host-relay/releases/download/v1.0.4/agent-linux-amd64",
-    "agent-linux-arm64": "https://github.com/denver9527/host-relay/releases/download/v1.0.4/agent-linux-arm64",
-    "agent-linux-386": "https://github.com/denver9527/host-relay/releases/download/v1.0.4/agent-linux-386",
-    "agent-linux-arm": "https://github.com/denver9527/host-relay/releases/download/v1.0.4/agent-linux-arm"
+    "agent-linux-amd64": "https://github.com/denver9527/host-relay/releases/download/v" + VERSION + "/agent-linux-amd64",
+    "agent-linux-arm64": "https://github.com/denver9527/host-relay/releases/download/v" + VERSION + "/agent-linux-arm64",
+    "agent-linux-386": "https://github.com/denver9527/host-relay/releases/download/v" + VERSION + "/agent-linux-386",
+    "agent-linux-arm": "https://github.com/denver9527/host-relay/releases/download/v" + VERSION + "/agent-linux-arm"
   },
   mac: {
-    "agent-darwin-amd64": "https://github.com/denver9527/host-relay/releases/download/v1.0.4/agent-darwin-amd64",
-    "agent-darwin-arm64": "https://github.com/denver9527/host-relay/releases/download/v1.0.4/agent-darwin-arm64"
+    "agent-darwin-amd64": "https://github.com/denver9527/host-relay/releases/download/v" + VERSION + "/agent-darwin-amd64",
+    "agent-darwin-arm64": "https://github.com/denver9527/host-relay/releases/download/v" + VERSION + "/agent-darwin-arm64"
   },
   win: {
-    "agent-windows-amd64.exe": "https://github.com/denver9527/host-relay/releases/download/v1.0.4/agent-windows-amd64.exe"
+    "agent-windows-amd64.exe": "https://github.com/denver9527/host-relay/releases/download/v" + VERSION + "/agent-windows-amd64.exe"
   }
 };
 
-const SESSION_TTL_MS   = 7 * 24 * 60 * 60 * 1000; // 会话有效期 7 天
-const LOGIN_MAX_FAILS  = 8;                        // 连续失败次数上限
-const LOGIN_LOCK_MS    = 15 * 60 * 1000;           // 锁定时长
+const SESSION_TTL_MS   = 24 * 60 * 60 * 1000; // 会话有效期 24 小时(公共电脑风险更低, self-hosted 可接受)
+const LOGIN_MAX_FAILS  = 5;                    // 连续失败次数上限(爆破窗口更小)
+const LOGIN_LOCK_MS    = 30 * 60 * 1000;       // 锁定时长(30 分钟)
 const PENDING_TTL_MS   = 24 * 60 * 60 * 1000;      // pending 主机未上线清理阈值
 const CLEANUP_EVERY_MS = 6 * 60 * 60 * 1000;       // 清理任务间隔
 const TICKET_TTL_MS    = 5 * 60 * 1000;             // SSH ticket 有效期(5 分钟,避免开页久了点连接即失效)
+const DEFAULT_ADMIN_PASSWORD = '123456';            // 未配置 ADMIN_PASSWORD secret 时的默认登录密码,部署后请立即在面板「修改密码」改掉
 const HUB_NAME = '_hub';
 
 // ============================ 工具函数 ============================
@@ -228,11 +231,11 @@ export default {
           return json({ ok: false, error: '服务端未配置 SESSION_SECRET' }, { status: 500 });
         }
         const pwInput = typeof body.password === 'string' ? body.password : '';
-        // 优先用 KV 中已修改的密码哈希;未改过则回退到 ADMIN_PASSWORD secret
+        // 优先用 KV 中已修改的密码哈希;未改过则回退到 ADMIN_PASSWORD secret,再回退默认密码
         const kvHash = env.RELAY_KV ? await env.RELAY_KV.get('admin:pwhash') : null;
         const pwOk = kvHash
           ? await verifyPassword(pwInput, kvHash)
-          : (env.ADMIN_PASSWORD ? timingSafeEqual(pwInput, env.ADMIN_PASSWORD) : false);
+          : timingSafeEqual(pwInput, env.ADMIN_PASSWORD || DEFAULT_ADMIN_PASSWORD);
         if (pwOk) {
           await hub(env).loginReset(ip);
           const token = await signSession(env.SESSION_SECRET, { exp: Date.now() + SESSION_TTL_MS });
@@ -252,13 +255,24 @@ export default {
         });
       }
 
-      // 以下接口均需会话
-      if (path.startsWith('/api/')) {
-        if (!(await isAuthed(request, env))) return json({ error: 'unauthorized' }, { status: 401 });
+        // 以下接口均需会话
+        if (path.startsWith('/api/')) {
+          if (!(await isAuthed(request, env))) return json({ error: 'unauthorized' }, { status: 401 });
 
-        if (path === '/api/hosts' && request.method === 'GET') {
-          return json({ hosts: await hub(env).listHosts() });
-        }
+          if (path === '/api/hosts' && request.method === 'GET') {
+            return json({ hosts: await hub(env).listHosts() });
+          }
+
+          // ---------- 回退密码(误操作 changepw 后恢复) ----------
+          if (path === '/api/restorepw' && request.method === 'POST') {
+            if (!env.RELAY_KV) return json({ error: '服务端未配置 KV 存储' }, { status: 500 });
+            const oldHash = await env.RELAY_KV.get('admin:pwhash:old');
+            if (!oldHash) return json({ error: '无可用回退密码' }, { status: 404 });
+            await env.RELAY_KV.put('admin:pwhash', oldHash);
+            // 清除回退备份
+            try { await env.RELAY_KV.delete('admin:pwhash:old'); } catch {}
+            return json({ ok: true, msg: '已恢复旧密码' });
+          }
 
         if (path === '/api/enroll' && request.method === 'POST') {
           const body = await request.json().catch(() => ({}));
@@ -300,8 +314,12 @@ export default {
           const kvHash = env.RELAY_KV ? await env.RELAY_KV.get('admin:pwhash') : null;
           const oldOk = kvHash
             ? await verifyPassword(oldPw, kvHash)
-            : (env.ADMIN_PASSWORD ? timingSafeEqual(oldPw, env.ADMIN_PASSWORD) : false);
+            : timingSafeEqual(oldPw, env.ADMIN_PASSWORD || DEFAULT_ADMIN_PASSWORD);
           if (!oldOk) return json({ error: '原密码错误' }, { status: 401 });
+          // 回退保护:写入新 hash 前保存旧 hash 到 admin:pwhash:old,保留 24h 可回退
+          if (kvHash) {
+            await env.RELAY_KV.put('admin:pwhash:old', kvHash, { expirationTtl: 86400 });
+          }
           await env.RELAY_KV.put('admin:pwhash', await hashPassword(newPw));
           return json({ ok: true });
         }
@@ -319,6 +337,11 @@ export default {
           const raw = await env.RELAY_KV.get('backup:hosts');
           if (!raw) return json({ error: '云端没有可用的备份' }, { status: 404 });
           let data; try { data = JSON.parse(raw); } catch { return json({ error: '备份数据损坏' }, { status: 500 }); }
+          // 校验:version=1 且 exportedAt 不超过 7 天(防过期备份注入)
+          if (data.version !== 1) return json({ error: '备份版本不兼容' }, { status: 400 });
+          if (data.exportedAt && Date.now() - data.exportedAt > 7 * 24 * 60 * 60 * 1000) {
+            return json({ error: '备份数据已过期(超过 7 天)' }, { status: 400 });
+          }
           const n = await hub(env).importHosts(data.hosts || []);
           return json({ ok: true, count: n });
         }
@@ -427,6 +450,8 @@ export class Hub extends DurableObject {
     this.sql.exec('UPDATE hosts SET tokenHash = ? WHERE hostId = ?', tokenHash, hostId);
     // 作废旧 token:更新 Host DO 并踢掉当前 agent(若在线),迫使用新 token 重连
     await this.env.HOST.getByName(hostId).resetToken(tokenHash);
+    // 广播 token 已更新(虽卡片不显示 token,但为将来扩展预留)
+    this._broadcastHost(hostId);
     return { hostId, token };
   }
 
@@ -440,8 +465,10 @@ export class Hub extends DurableObject {
 
   // ---------- 备份 / 恢复(云端 KV) ----------
   async exportHosts() {
+    // 只导出已接入/离线的主机,pending(未连上 agent 的临时态)不进备份,
+    // 避免恢复时把 pending 误变成 offline 卡片。
     return this.sql.exec(
-      'SELECT hostId, displayName, os, tokenHash, state, statusJson, createdAt FROM hosts'
+      "SELECT hostId, displayName, os, tokenHash, state, statusJson, createdAt FROM hosts WHERE state IN ('active','offline')"
     ).toArray();
   }
   async importHosts(list) {
@@ -456,7 +483,7 @@ export class Hub extends DurableObject {
            state=excluded.state, statusJson=excluded.statusJson, createdAt=excluded.createdAt`,
         h.hostId, h.displayName || '', h.os || '', h.tokenHash || '', h.state || 'offline', 0,
         h.statusJson || null, h.createdAt || Date.now());
-      // 还原令牌到 Host DO,使已连 agent 用原 token 继续工作
+      // 还原令牌到 Host DO,使已连 agent 用原 token 继续工作(恢复后旧 token 仍可用,无需重新生成)
       try { await this.env.HOST.getByName(h.hostId).provision(h.hostId, h.tokenHash); } catch {}
       n++;
     }
@@ -518,6 +545,8 @@ export class Hub extends DurableObject {
     for (const row of stale) {
       this.sql.exec('DELETE FROM hosts WHERE hostId = ?', row.hostId);
       try { await this.env.HOST.getByName(row.hostId).deprovision(); } catch {}
+      // 通知浏览器侧 pending 已被清理(避免外部消费者看到旧状态)
+      this._broadcastRemove(row.hostId);
     }
     const remain = this.sql.exec('SELECT COUNT(*) AS n FROM hosts').toArray()[0];
     if (remain && remain.n > 0) await this.ctx.storage.setAlarm(Date.now() + CLEANUP_EVERY_MS);
@@ -570,7 +599,7 @@ export class Host extends DurableObject {
       await this.ctx.storage.put(nkey, obj.exp, { expirationTtl: nonceTtl });
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
-      server.serializeAttachment({ role: 'browser', cid: randomCid() });
+      server.serializeAttachment({ role: 'browser', cid: await this._allocCid() });
       this.ctx.acceptWebSocket(server, ['browser']);
       return new Response(null, { status: 101, webSocket: client });
     }
@@ -695,6 +724,17 @@ export class Host extends DurableObject {
     }
     return null;
   }
+  // 分配一个当前未被活跃 browser 占用的 cid。协议层 cid 为 uint16(agent 侧截断),
+  // 故在 1..65535 空间内做拒绝采样:若随机到的 cid 已被某终端会话使用则重生成,
+  // 把运行时串台概率降到≈0(并发会话数远小于空间大小,采样几乎一次命中)。
+  async _allocCid() {
+    for (let i = 0; i < 64; i++) {
+      const c = randomCid();
+      if (!this._browserByCid(c)) return c;
+    }
+    // 极端兜底:直接返回(理论上并发会话接近 65535 才会走到)
+    return randomCid();
+  }
   _sendBrowser(ws, obj) { try { ws.send(JSON.stringify(obj)); } catch {} }
 
   async webSocketClose(ws) {
@@ -766,8 +806,9 @@ const PAGE_HTML = `<!DOCTYPE html>
 
   /* 卡片 */
   .grid{display:flex;flex-wrap:wrap;gap:16px}
-  .grid > .card{flex:1 1 300px;max-width:calc(50% - 8px)}
-  @media(max-width:768px){.grid > .card{max-width:100%}}
+  .grid > .card{flex:0 0 calc((100% - 32px) / 3);max-width:calc((100% - 32px) / 3);min-width:0;overflow:hidden}
+  @media(max-width:1100px){.grid > .card{flex:0 0 calc((100% - 16px) / 2);max-width:calc((100% - 16px) / 2)}}
+  @media(max-width:640px){.grid > .card{flex:0 0 100%;max-width:100%}}
   .empty{color:var(--muted);text-align:center;padding:60px 0;font-size:14px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 16px 14px;
     position:relative;overflow:hidden}
@@ -845,7 +886,7 @@ var hosts = {};
 var uiState = { openIps: {} }; // 记录哪些主机的 IP 是展开状态的
 
 function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g,function(c){
-  return {"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}[c]; }); }
+  return {"&":"&amp;","<":"&lt;",">":"&gt;","\\":"&#92;"}[c] || c; }); }
 function fmtBytes(n){ if(!n&&n!==0) return "-"; var u=["B","KB","MB","GB","TB"],i=0;
   while(n>=1024&&i<u.length-1){n/=1024;i++;} return n.toFixed(n<10&&i>0?1:0)+u[i]; }
 function fmtUptime(s){ if(!s) return "-"; s=Math.floor(s); var d=Math.floor(s/86400);
@@ -1070,12 +1111,22 @@ function showEnroll(el, data){
           var id = 'tab-' + binName.replace(/[^a-zA-Z0-9]/g, '-');
           var url = bins[binName];
           var cmdStr = "./" + binName + " --server " + data.serverUrl + " --id " + data.hostId + " --token " + data.token;
-          
+          var isUnix = (os !== 'win');
+          var downloadCmd = (os === 'win' ? 'curl -L -o "' + binName + '" "' + url + '"' : 'curl -L -o ' + binName + ' ' + url);
+          var chmodCmd = 'chmod 775 ./' + binName;
+          var installCmd = 'sudo cp ./' + binName + ' /usr/local/bin/agent';
+
           tagsHtml += '<button class="tag-btn ' + (first ? 'active' : '') + '" data-target="' + id + '">' + esc(os) + ' (' + esc(binName) + ')</button>';
-          
+
           contentsHtml += '<div class="tab-content ' + (first ? 'active' : '') + '" id="' + id + '">' +
             (url ? '<a href="' + esc(url) + '" target="_blank" rel="noopener" class="dl-btn">⬇️ 点击下载 ' + esc(binName) + '</a>' : '') +
-            '<div class="cmd"><pre>' + esc(cmdStr) + '</pre>' +
+            '<div class="cmd"><pre># 下载二进制(无浏览器时用)\n' + esc(downloadCmd) + '</pre>' +
+            '<button class="copy" onclick="copyCmd(this.previousSibling.innerText, this)">复制下载</button></div>' +
+            (isUnix ? '<div class="cmd"><pre># 赋予执行权限\n' + esc(chmodCmd) + '</pre>' +
+            '<button class="copy" onclick="copyCmd(this.previousSibling.innerText, this)">复制赋权</button></div>' : '') +
+            (isUnix ? '<div class="cmd"><pre># 安装到系统路径(可选)\n' + esc(installCmd) + '</pre>' +
+            '<button class="copy" onclick="copyCmd(this.previousSibling.innerText, this)">复制安装</button></div>' : '') +
+            '<div class="cmd"><pre># 启动 agent\n' + esc(cmdStr) + '</pre>' +
             '<button class="copy" onclick="copyCmd(this.previousSibling.innerText, this)">复制命令</button></div>' +
           '</div>';
           
@@ -1109,11 +1160,31 @@ function showEnroll(el, data){
 window.copyCmd = function(text, btn) {
   if (btn.dataset.copying) return;
   btn.dataset.copying = "1";
-  navigator.clipboard.writeText(text).then(function(){
-    var oldText = btn.textContent;
-    btn.textContent = "已复制";
-    setTimeout(function(){ btn.textContent = oldText; delete btn.dataset.copying; }, 2000);
-  });
+  try {
+    navigator.clipboard.writeText(text).then(function(){
+      var oldText = btn.textContent;
+      btn.textContent = "已复制";
+      setTimeout(function(){ btn.textContent = oldText; delete btn.dataset.copying; }, 2000);
+    }).catch(function(){ throw 'clipboard_failed'; });
+  } catch(e) {
+    // fallback: 非 HTTPS 环境或 clipboard API 被拒时,使用 execCommand 降级
+    try {
+      var textarea = document.createElement("textarea");
+      textarea.value = text;
+      textarea.style.position = "fixed";
+      textarea.style.left = "-9999px";
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand("copy");
+      document.body.removeChild(textarea);
+      var oldText = btn.textContent;
+      btn.textContent = "已复制";
+      setTimeout(function(){ btn.textContent = oldText; delete btn.dataset.copying; }, 2000);
+    } catch(e2) {
+      btn.textContent = "复制失败";
+      setTimeout(function(){ delete btn.dataset.copying; }, 2000);
+    }
+  }
 };
 
 function regen(id){
@@ -1162,11 +1233,32 @@ function doBackup(){
   });
 }
 function confirmRestore(){
-  if(!confirm("将从云端恢复主机信息,覆盖当前面板的主机列表,确定吗?")) return;
-  api("/api/restore",{}).then(function(r){
-    if(r.body.ok){ alert("已恢复 "+r.body.count+" 台主机"); if(ws) ws.close(); connectWS(); }
-    else alert(r.body.error||"恢复失败");
-  });
+  var mask=document.createElement("div"); mask.className="mask";
+  mask.innerHTML=
+    '<div class="modal" style="width:500px"><h2>从云端恢复<span class="x">&times;</span></h2>'+
+    '<div class="step"><div class="h">此操作将<strong>覆盖</strong>当前面板所有主机列表。请输入面板密码二次确认。</div></div>'+
+    '<div class="row-name" style="margin-bottom:16px;"><input id="restore-pw" type="password" placeholder="面板密码" autocomplete="off"></div>'+
+    '<div class="err" id="restore-err"></div>'+
+    '<div style="text-align:right"><button class="ghost x-btn" style="margin-right:10px">取消</button>'+
+    '<button class="primary" id="do-restore" style="background:var(--red);border-color:var(--red);color:#fff;">确认恢复</button></div></div>';
+  document.body.appendChild(mask);
+  function close(){ document.body.removeChild(mask); }
+  mask.querySelector(".x").onclick=close;
+  mask.querySelector(".x-btn").onclick=close;
+  mask.onclick=function(e){ if(e.target===mask) close(); };
+  mask.querySelector("#do-restore").onclick=function(){
+    var pw=mask.querySelector("#restore-pw").value;
+    if(!pw){ mask.querySelector("#restore-err").textContent="请输入密码确认"; return; }
+    // 先验证密码
+    api("/api/login",{password:pw}).then(function(r){
+      if(!r.body.ok){ mask.querySelector("#restore-err").textContent="密码错误"; return; }
+      // 密码正确，执行恢复
+      api("/api/restore",{}).then(function(r){
+        if(r.body.ok){ close(); alert("已恢复 "+r.body.count+" 台主机"); if(ws) ws.close(); connectWS(); }
+        else alert(r.body.error||"恢复失败");
+      });
+    });
+  };
 }
 
 // ---------------- 状态 WS ----------------

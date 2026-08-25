@@ -32,7 +32,7 @@ import (
 	"github.com/shirou/gopsutil/v3/mem"
 )
 
-const version = "1.0.4"
+const version = "1.0.5"
 
 var (
 	server    = flag.String("server", "", "服务端地址,如 wss://host-relay.example.com(必填)")

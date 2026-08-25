@@ -8,17 +8,17 @@ import { DurableObject } from 'cloudflare:workers';
 // 各平台客户端下载地址(自行替换为你发布的二进制地址,不替换则可以用这个默认的)。
 const CLIENT_URL = {
   linux: {
-    "agent-linux-amd64": "https://github.com/denver9527/host-relay/releases/download/v1.0.3/agent-linux-amd64",
-    "agent-linux-arm64": "https://github.com/denver9527/host-relay/releases/download/v1.0.3/agent-linux-arm64",
-    "agent-linux-386": "https://github.com/denver9527/host-relay/releases/download/v1.0.3/agent-linux-386",
-    "agent-linux-arm": "https://github.com/denver9527/host-relay/releases/download/v1.0.3/agent-linux-arm"
+    "agent-linux-amd64": "https://github.com/denver9527/host-relay/releases/download/v1.0.4/agent-linux-amd64",
+    "agent-linux-arm64": "https://github.com/denver9527/host-relay/releases/download/v1.0.4/agent-linux-arm64",
+    "agent-linux-386": "https://github.com/denver9527/host-relay/releases/download/v1.0.4/agent-linux-386",
+    "agent-linux-arm": "https://github.com/denver9527/host-relay/releases/download/v1.0.4/agent-linux-arm"
   },
   mac: {
-    "agent-darwin-amd64": "https://github.com/denver9527/host-relay/releases/download/v1.0.3/agent-darwin-amd64",
-    "agent-darwin-arm64": "https://github.com/denver9527/host-relay/releases/download/v1.0.3/agent-darwin-arm64"
+    "agent-darwin-amd64": "https://github.com/denver9527/host-relay/releases/download/v1.0.4/agent-darwin-amd64",
+    "agent-darwin-arm64": "https://github.com/denver9527/host-relay/releases/download/v1.0.4/agent-darwin-arm64"
   },
   win: {
-    "agent-windows-amd64.exe": "https://github.com/denver9527/host-relay/releases/download/v1.0.3/agent-windows-amd64.exe"
+    "agent-windows-amd64.exe": "https://github.com/denver9527/host-relay/releases/download/v1.0.4/agent-windows-amd64.exe"
   }
 };
 
@@ -62,6 +62,30 @@ function timingSafeEqual(a, b) {
   let diff = 0;
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
+}
+
+function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return out;
+}
+
+// ---------- 面板密码(PBKDF2, 哈希存于 KV, 支持运行时修改) ----------
+async function hashPassword(pw) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iter = 100000;
+  const key = await crypto.subtle.importKey('raw', enc.encode(pw), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations: iter, hash: 'SHA-256' }, key, 256);
+  return 'pbkdf2$' + toHex(salt) + '$' + toHex(bits) + '$' + iter;
+}
+async function verifyPassword(pw, stored) {
+  if (typeof stored !== 'string' || !stored.startsWith('pbkdf2$')) return false;
+  const [, saltHex, hashHex, iterS] = stored.split('$');
+  let salt, iter;
+  try { salt = hexToBytes(saltHex); iter = parseInt(iterS, 10) || 100000; } catch { return false; }
+  const key = await crypto.subtle.importKey('raw', enc.encode(pw), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations: iter, hash: 'SHA-256' }, key, 256);
+  return timingSafeEqual(toHex(bits), hashHex);
 }
 
 async function hmacKey(secret) {
@@ -200,10 +224,16 @@ export default {
         const locked = await hub(env).loginLocked(ip);
         if (locked) return json({ ok: false, error: '尝试过于频繁,请稍后再试' }, { status: 429 });
         const body = await request.json().catch(() => ({}));
-        if (!env.ADMIN_PASSWORD || !env.SESSION_SECRET) {
-          return json({ ok: false, error: '服务端未配置 ADMIN_PASSWORD / SESSION_SECRET' }, { status: 500 });
+        if (!env.SESSION_SECRET) {
+          return json({ ok: false, error: '服务端未配置 SESSION_SECRET' }, { status: 500 });
         }
-        if (typeof body.password === 'string' && timingSafeEqual(body.password, env.ADMIN_PASSWORD)) {
+        const pwInput = typeof body.password === 'string' ? body.password : '';
+        // 优先用 KV 中已修改的密码哈希;未改过则回退到 ADMIN_PASSWORD secret
+        const kvHash = env.RELAY_KV ? await env.RELAY_KV.get('admin:pwhash') : null;
+        const pwOk = kvHash
+          ? await verifyPassword(pwInput, kvHash)
+          : (env.ADMIN_PASSWORD ? timingSafeEqual(pwInput, env.ADMIN_PASSWORD) : false);
+        if (pwOk) {
           await hub(env).loginReset(ip);
           const token = await signSession(env.SESSION_SECRET, { exp: Date.now() + SESSION_TTL_MS });
           return json({ ok: true }, {
@@ -260,6 +290,37 @@ export default {
             exp: Date.now() + TICKET_TTL_MS, h: hostId, n: randomToken(8),
           });
           return json({ ticket });
+        }
+
+        if (path === '/api/changepw' && request.method === 'POST') {
+          const b = await request.json().catch(() => ({}));
+          const oldPw = typeof b.oldPassword === 'string' ? b.oldPassword : '';
+          const newPw = typeof b.newPassword === 'string' ? b.newPassword : '';
+          if (newPw.length < 6) return json({ error: '新密码至少 6 位' }, { status: 400 });
+          const kvHash = env.RELAY_KV ? await env.RELAY_KV.get('admin:pwhash') : null;
+          const oldOk = kvHash
+            ? await verifyPassword(oldPw, kvHash)
+            : (env.ADMIN_PASSWORD ? timingSafeEqual(oldPw, env.ADMIN_PASSWORD) : false);
+          if (!oldOk) return json({ error: '原密码错误' }, { status: 401 });
+          await env.RELAY_KV.put('admin:pwhash', await hashPassword(newPw));
+          return json({ ok: true });
+        }
+
+        if (path === '/api/backup' && request.method === 'POST') {
+          if (!env.RELAY_KV) return json({ error: '服务端未配置 KV 存储' }, { status: 500 });
+          const hosts = await hub(env).exportHosts();
+          const payload = JSON.stringify({ version: 1, exportedAt: Date.now(), count: hosts.length, hosts });
+          await env.RELAY_KV.put('backup:hosts', payload);
+          return json({ ok: true, count: hosts.length });
+        }
+
+        if (path === '/api/restore' && request.method === 'POST') {
+          if (!env.RELAY_KV) return json({ error: '服务端未配置 KV 存储' }, { status: 500 });
+          const raw = await env.RELAY_KV.get('backup:hosts');
+          if (!raw) return json({ error: '云端没有可用的备份' }, { status: 404 });
+          let data; try { data = JSON.parse(raw); } catch { return json({ error: '备份数据损坏' }, { status: 500 }); }
+          const n = await hub(env).importHosts(data.hosts || []);
+          return json({ ok: true, count: n });
         }
       }
 
@@ -376,6 +437,34 @@ export class Hub extends DurableObject {
   }
 
   async listHosts() { return this._hostList(); }
+
+  // ---------- 备份 / 恢复(云端 KV) ----------
+  async exportHosts() {
+    return this.sql.exec(
+      'SELECT hostId, displayName, os, tokenHash, state, statusJson, createdAt FROM hosts'
+    ).toArray();
+  }
+  async importHosts(list) {
+    let n = 0;
+    for (const h of (list || [])) {
+      if (!h || !h.hostId) continue;
+      this.sql.exec(
+        `INSERT INTO hosts(hostId, displayName, os, tokenHash, state, lastSeen, statusJson, createdAt)
+         VALUES(?,?,?,?,?,?,?,?)
+         ON CONFLICT(hostId) DO UPDATE SET
+           displayName=excluded.displayName, os=excluded.os, tokenHash=excluded.tokenHash,
+           state=excluded.state, statusJson=excluded.statusJson, createdAt=excluded.createdAt`,
+        h.hostId, h.displayName || '', h.os || '', h.tokenHash || '', h.state || 'offline', 0,
+        h.statusJson || null, h.createdAt || Date.now());
+      // 还原令牌到 Host DO,使已连 agent 用原 token 继续工作
+      try { await this.env.HOST.getByName(h.hostId).provision(h.hostId, h.tokenHash); } catch {}
+      n++;
+    }
+    await this._ensureAlarm();
+    const snap = JSON.stringify({ type: 'snapshot', hosts: this._hostList() });
+    for (const ws of this.ctx.getWebSockets('sub')) { try { ws.send(snap); } catch {} }
+    return n;
+  }
 
   // ---------- 由 Host DO 回调 ----------
   async activate(hostId, os) {
@@ -796,9 +885,15 @@ function renderApp(){
     '<div class="brand"><b>host</b>-relay<span class="tag">主机管理面板</span></div>'+
     '<div class="toolbar">'+
     '<button class="primary" id="add">添加主机</button>'+
+    '<button class="ghost" id="chpw">修改密码</button>'+
+    '<button class="ghost" id="backup">备份云端</button>'+
+    '<button class="ghost" id="restore">从云端恢复</button>'+
     '<button class="ghost" id="logout">退出</button>'+
     '</div></header><div id="list"></div></div>';
   document.getElementById("add").onclick=openAdd;
+  document.getElementById("chpw").onclick=openChangePw;
+  document.getElementById("backup").onclick=doBackup;
+  document.getElementById("restore").onclick=confirmRestore;
   document.getElementById("logout").onclick=function(){
     var mask=document.createElement("div"); mask.className="mask";
     mask.innerHTML=
@@ -1030,6 +1125,47 @@ function regen(id){
     mask.querySelector(".x").onclick=function(){ document.body.removeChild(mask); };
     mask.onclick=function(e){ if(e.target===mask) document.body.removeChild(mask); };
     showEnroll(mask.querySelector("#result"), r.body);
+  });
+}
+
+function openChangePw(){
+  var mask=document.createElement("div"); mask.className="mask";
+  mask.innerHTML=
+    '<div class="modal"><h2>修改密码<span class="x">&times;</span></h2>'+
+    '<div class="row-name"><input id="opw" type="password" placeholder="原密码" autocomplete="off"></div>'+
+    '<div class="row-name"><input id="npw" type="password" placeholder="新密码(至少6位)" autocomplete="off"></div>'+
+    '<div class="row-name"><input id="npw2" type="password" placeholder="确认新密码" autocomplete="off"></div>'+
+    '<div class="err" id="pw-err"></div>'+
+    '<div style="text-align:right"><button class="ghost x-btn" style="margin-right:10px">取消</button>'+
+    '<button class="primary" id="do-chpw">确认修改</button></div></div>';
+  document.body.appendChild(mask);
+  function close(){ document.body.removeChild(mask); }
+  mask.querySelector(".x").onclick=close;
+  mask.querySelector(".x-btn").onclick=close;
+  mask.onclick=function(e){ if(e.target===mask) close(); };
+  mask.querySelector("#do-chpw").onclick=function(){
+    var opw=mask.querySelector("#opw").value, npw=mask.querySelector("#npw").value, npw2=mask.querySelector("#npw2").value;
+    var err=mask.querySelector("#pw-err");
+    if(npw.length<6){ err.textContent="新密码至少 6 位"; return; }
+    if(npw!==npw2){ err.textContent="两次输入不一致"; return; }
+    api("/api/changepw",{oldPassword:opw,newPassword:npw}).then(function(r){
+      if(r.body.ok){ close(); alert("密码已修改,请使用新密码重新登录"); api("/api/logout",{}).then(function(){ if(ws) ws.close(); renderLogin(); }); }
+      else err.textContent=r.body.error||"修改失败";
+    });
+  };
+}
+function doBackup(){
+  if(!confirm("将把当前所有主机信息(含连接令牌)备份到云端 KV,确定吗?")) return;
+  api("/api/backup",{}).then(function(r){
+    if(r.body.ok) alert("已备份 "+r.body.count+" 台主机到云端");
+    else alert(r.body.error||"备份失败");
+  });
+}
+function confirmRestore(){
+  if(!confirm("将从云端恢复主机信息,覆盖当前面板的主机列表,确定吗?")) return;
+  api("/api/restore",{}).then(function(r){
+    if(r.body.ok){ alert("已恢复 "+r.body.count+" 台主机"); if(ws) ws.close(); connectWS(); }
+    else alert(r.body.error||"恢复失败");
   });
 }
 

@@ -24,6 +24,11 @@ class_name = "Hub"
 name = "HOST"
 class_name = "Host"
 
+# 面板密码哈希 + 主机备份(修改密码 / 一键备份云端 / 从云端恢复 用)
+[[kv_namespaces]]
+binding = "RELAY_KV"
+id = "164f56a2f8004a27bad8efebfc07fd37"
+
 # 这条 migration 就是"必须用 wrangler 跑一次"的原因;SQLite 类,免费计划可用。
 [[migrations]]
 tag = "v1"

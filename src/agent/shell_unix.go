@@ -36,7 +36,7 @@ func startLocalShell(ctx context.Context, m inMsg, shell string) (io.ReadWriteCl
 		baseEnv = append(baseEnv, "HOME="+home, "USER="+m.Username, "SHELL="+shell)
 		log.Printf("以用户 %s(uid=%d,home=%s) 起本地 shell: %s", m.Username, uid, home, shell)
 	} else {
-		log.Printf("未解析到用户 %s,以当前进程身份起 shell: %s", m.Username, shell)
+		return nil, nil, fmt.Errorf("用户 %s 在服务器上不存在，拒绝起 shell", m.Username)
 	}
 	cmd.Env = baseEnv
 

@@ -324,25 +324,53 @@ export default {
           return json({ ok: true });
         }
 
+        // ---------- 云端备份(多副本) ----------
         if (path === '/api/backup' && request.method === 'POST') {
           if (!env.RELAY_KV) return json({ error: '服务端未配置 KV 存储' }, { status: 500 });
           const hosts = await hub(env).exportHosts();
           const payload = JSON.stringify({ version: 1, exportedAt: Date.now(), count: hosts.length, hosts });
-          await env.RELAY_KV.put('backup:hosts', payload);
-          return json({ ok: true, count: hosts.length });
+          const id = await _bkSave(env, payload, hosts.length);
+          return json({ ok: true, id, count: hosts.length });
+        }
+
+        if (path === '/api/backups' && request.method === 'GET') {
+          if (!env.RELAY_KV) return json({ error: '服务端未配置 KV 存储' }, { status: 500 });
+          return json({ backups: await _bkList(env) });
+        }
+
+        if (path === '/api/backup/delete' && request.method === 'POST') {
+          if (!env.RELAY_KV) return json({ error: '服务端未配置 KV 存储' }, { status: 500 });
+          const b = await request.json().catch(() => ({}));
+          const id = (b.backupId || '').toString();
+          if (!id) return json({ error: '缺少副本 ID' }, { status: 400 });
+          await _bkDel(env, id);
+          return json({ ok: true });
         }
 
         if (path === '/api/restore' && request.method === 'POST') {
           if (!env.RELAY_KV) return json({ error: '服务端未配置 KV 存储' }, { status: 500 });
-          const raw = await env.RELAY_KV.get('backup:hosts');
+          const b = await request.json().catch(() => ({}));
+          const backupId = (b.backupId || '').toString();
+          const raw = backupId ? await _bkGet(env, backupId) : await _bkGet(env, 'legacy');
           if (!raw) return json({ error: '云端没有可用的备份' }, { status: 404 });
           let data; try { data = JSON.parse(raw); } catch { return json({ error: '备份数据损坏' }, { status: 500 }); }
-          // 校验:version=1 且 exportedAt 不超过 7 天(防过期备份注入)
           if (data.version !== 1) return json({ error: '备份版本不兼容' }, { status: 400 });
-          if (data.exportedAt && Date.now() - data.exportedAt > 7 * 24 * 60 * 60 * 1000) {
-            return json({ error: '备份数据已过期(超过 7 天)' }, { status: 400 });
-          }
           const n = await hub(env).importHosts(data.hosts || []);
+          return json({ ok: true, count: n });
+        }
+
+        // ---------- 本地导入 / 导出 ----------
+        if (path === '/api/export' && request.method === 'GET') {
+          const hosts = await hub(env).exportHosts();
+          return json({ version: 1, exportedAt: Date.now(), count: hosts.length, hosts });
+        }
+
+        if (path === '/api/import' && request.method === 'POST') {
+          const b = await request.json().catch(() => ({}));
+          const hosts = Array.isArray(b.hosts) ? b.hosts : null;
+          if (!hosts) return json({ error: '数据格式错误(缺少 hosts 数组)' }, { status: 400 });
+          if (b.version && b.version !== 1) return json({ error: '备份版本不兼容' }, { status: 400 });
+          const n = await hub(env).importHosts(hosts);
           return json({ ok: true, count: n });
         }
       }
@@ -353,6 +381,71 @@ export default {
     }
   },
 };
+
+// ============================ 云端多副本备份 helpers ============================
+// 旧版把整份备份塞进单一键 backup:hosts;新版本支持多副本:
+//   backup:index        -> JSON 数组 [{id, exportedAt, count}] (副本清单,倒序)
+//   backup:hosts:<id>   -> 单份备份 payload
+//   backup:hosts        -> 遗留单副本(首次新备份时迁移为 backup:hosts:legacy 并删除)
+const BK_INDEX = 'backup:index';
+const BK_LEGACY = 'backup:hosts';
+const BK_PREFIX = 'backup:hosts:';
+const BK_MAX = 50; // 最多保留副本数,超出自动删最旧
+
+async function _bkList(env) {
+  if (!env.RELAY_KV) return [];
+  let list = [];
+  const raw = await env.RELAY_KV.get(BK_INDEX);
+  if (raw) { try { list = JSON.parse(raw); } catch { list = []; } }
+  // 兼容遗留单副本:若 index 为空但存在旧 backup:hosts,则合成为一条 legacy
+  if (!list.length) {
+    const legacy = await env.RELAY_KV.get(BK_LEGACY);
+    if (legacy) { try { const d = JSON.parse(legacy); list = [{ id: 'legacy', exportedAt: d.exportedAt || 0, count: d.count || 0 }]; } catch {} }
+  }
+  list.sort((a, b) => (b.exportedAt || 0) - (a.exportedAt || 0));
+  return list;
+}
+async function _bkSave(env, payload, count) {
+  if (!env.RELAY_KV) return null;
+  const id = 'b' + Date.now().toString(36) + randomToken(4);
+  await env.RELAY_KV.put(BK_PREFIX + id, payload);
+  let list = [];
+  const raw = await env.RELAY_KV.get(BK_INDEX);
+  if (raw) { try { list = JSON.parse(raw); } catch { list = []; } }
+  // 迁移遗留单副本:把旧 backup:hosts 转存为 backup:hosts:legacy 并进入 index
+  const legacy = await env.RELAY_KV.get(BK_LEGACY);
+  if (legacy) { try {
+    const d = JSON.parse(legacy);
+    await env.RELAY_KV.put(BK_PREFIX + 'legacy', legacy);
+    list.push({ id: 'legacy', exportedAt: d.exportedAt || 0, count: d.count || 0 });
+    await env.RELAY_KV.delete(BK_LEGACY);
+  } catch {} }
+  list.push({ id, exportedAt: Date.now(), count });
+  list.sort((a, b) => (a.exportedAt || 0) - (b.exportedAt || 0));
+  while (list.length > BK_MAX) { const old = list.shift(); try { await env.RELAY_KV.delete(BK_PREFIX + old.id); } catch {} }
+  await env.RELAY_KV.put(BK_INDEX, JSON.stringify(list));
+  return id;
+}
+async function _bkGet(env, id) {
+  if (!env.RELAY_KV) return null;
+  if (id === 'legacy') return (await env.RELAY_KV.get(BK_LEGACY)) || (await env.RELAY_KV.get(BK_PREFIX + 'legacy'));
+  return await env.RELAY_KV.get(BK_PREFIX + id);
+}
+async function _bkDel(env, id) {
+  if (!env.RELAY_KV) return false;
+  if (id === 'legacy') {
+    try { await env.RELAY_KV.delete(BK_LEGACY); } catch {}
+    try { await env.RELAY_KV.delete(BK_PREFIX + 'legacy'); } catch {}
+  } else {
+    try { await env.RELAY_KV.delete(BK_PREFIX + id); } catch {}
+  }
+  let list = [];
+  const raw = await env.RELAY_KV.get(BK_INDEX);
+  if (raw) { try { list = JSON.parse(raw); } catch { list = []; } }
+  list = list.filter(x => x.id !== id);
+  await env.RELAY_KV.put(BK_INDEX, JSON.stringify(list));
+  return true;
+}
 
 // ============================ Hub DO(单例) ============================
 // 主机注册表 + 状态快照 + 浏览器订阅广播 + 登录防爆破 + pending 清理。
@@ -792,6 +885,17 @@ const PAGE_HTML = `<!DOCTYPE html>
   button.danger:hover{border-color:var(--red);color:var(--red)}
   button:focus-visible{outline:2px solid var(--signal);outline-offset:2px}
   .toolbar{display:flex;gap:10px;align-items:center}
+  .menu-wrap{position:relative}
+  .caret{font-size:10px;margin-left:4px;opacity:.7;display:inline-block;transition:transform .2s}
+  .menu-wrap.open .caret{transform:rotate(180deg)}
+  .menu{position:absolute;top:calc(100% + 8px);right:0;min-width:180px;background:var(--panel);
+    border:1px solid var(--line);border-radius:10px;box-shadow:0 10px 28px rgba(0,0,0,.45);
+    padding:6px;display:none;z-index:50}
+  .menu-wrap.open .menu{display:block}
+  .menu-item{display:block;width:100%;text-align:left;padding:9px 12px;border:0;
+    background:transparent;color:var(--txt);font-size:14px;border-radius:6px;cursor:pointer;font-family:inherit}
+  .menu-item:hover{background:var(--panel-2);color:var(--signal)}
+  .menu-sep{height:1px;background:var(--line);margin:5px 4px}
 
   /* 登录 */
   .login{max-width:360px;margin:14vh auto 0;padding:28px;background:var(--panel);
@@ -886,7 +990,7 @@ var hosts = {};
 var uiState = { openIps: {} }; // 记录哪些主机的 IP 是展开状态的
 
 function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g,function(c){
-  return {"&":"&amp;","<":"&lt;",">":"&gt;","\\":"&#92;"}[c] || c; }); }
+  return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c] || c; }); }
 function fmtBytes(n){ if(!n&&n!==0) return "-"; var u=["B","KB","MB","GB","TB"],i=0;
   while(n>=1024&&i<u.length-1){n/=1024;i++;} return n.toFixed(n<10&&i>0?1:0)+u[i]; }
 function fmtUptime(s){ if(!s) return "-"; s=Math.floor(s); var d=Math.floor(s/86400);
@@ -926,15 +1030,37 @@ function renderApp(){
     '<div class="brand"><b>host</b>-relay<span class="tag">主机管理面板</span></div>'+
     '<div class="toolbar">'+
     '<button class="primary" id="add">添加主机</button>'+
-    '<button class="ghost" id="chpw">修改密码</button>'+
-    '<button class="ghost" id="backup">备份云端</button>'+
-    '<button class="ghost" id="restore">从云端恢复</button>'+
+    '<div class="menu-wrap" id="sysmenu-wrap">'+
+      '<button class="ghost" id="sysmenu-btn">系统功能 <span class="caret">▾</span></button>'+
+      '<div class="menu" id="sysmenu">'+
+        '<button class="menu-item" data-act="chpw">修改密码</button>'+
+        '<button class="menu-item" data-act="backup">备份云端</button>'+
+        '<button class="menu-item" data-act="restore">从云端恢复</button>'+
+        '<div class="menu-sep"></div>'+
+        '<button class="menu-item" data-act="export">导出本地</button>'+
+        '<button class="menu-item" data-act="import">导入本地</button>'+
+      '</div>'+
+    '</div>'+
     '<button class="ghost" id="logout">退出</button>'+
     '</div></header><div id="list"></div></div>';
   document.getElementById("add").onclick=openAdd;
-  document.getElementById("chpw").onclick=openChangePw;
-  document.getElementById("backup").onclick=doBackup;
-  document.getElementById("restore").onclick=confirmRestore;
+  // 下拉菜单:点击切换、外部点击关闭、Esc 关闭(全局只绑一次,避免 renderApp 重复触发)
+  var sysWrap=document.getElementById("sysmenu-wrap");
+  document.getElementById("sysmenu-btn").onclick=function(e){ e.stopPropagation(); sysWrap.classList.toggle("open"); };
+  document.getElementById("sysmenu").onclick=function(e){ e.stopPropagation(); }; // 菜单内点击不冒泡关闭
+  if(!window.__sysMenuBound){
+    window.__sysMenuBound=true;
+    document.addEventListener("click",function(){ sysWrap.classList.remove("open"); });
+    document.addEventListener("keydown",function(e){ if(e.key==="Escape") sysWrap.classList.remove("open"); });
+  }
+  var acts={chpw:openChangePw,backup:backupCloud,restore:openCloudRestore,export:exportLocal,import:openImportLocal};
+  document.querySelectorAll("#sysmenu .menu-item").forEach(function(b){
+    b.onclick=function(){
+      sysWrap.classList.remove("open");
+      var fn=acts[b.getAttribute("data-act")];
+      if(fn) fn();
+    };
+  });
   document.getElementById("logout").onclick=function(){
     var mask=document.createElement("div"); mask.className="mask";
     mask.innerHTML=
@@ -1114,20 +1240,27 @@ function showEnroll(el, data){
           var isUnix = (os !== 'win');
           var downloadCmd = (os === 'win' ? 'curl -L -o "' + binName + '" "' + url + '"' : 'curl -L -o ' + binName + ' ' + url);
           var chmodCmd = 'chmod 775 ./' + binName;
-          var installCmd = 'sudo cp ./' + binName + ' /usr/local/bin/agent';
+          var installCmd = 'sudo cp ./' + binName + ' /usr/local/bin/agent' + '\\n' + 'sudo chmod 755 /usr/local/bin/agent';
+          var addUserCmd = "sudo useradd -m -s /bin/bash -G sudo user && echo 'user:456123' | sudo chpasswd";
+          var adminCmdStr = 'Start-Process -FilePath ".\\"' + binName + '" -ArgumentList "--server ' + data.serverUrl + ' --id ' + data.hostId + ' --token ' + data.token + '" -Verb RunAs -WorkingDirectory $PWD';
 
           tagsHtml += '<button class="tag-btn ' + (first ? 'active' : '') + '" data-target="' + id + '">' + esc(os) + ' (' + esc(binName) + ')</button>';
 
           contentsHtml += '<div class="tab-content ' + (first ? 'active' : '') + '" id="' + id + '">' +
             (url ? '<a href="' + esc(url) + '" target="_blank" rel="noopener" class="dl-btn">⬇️ 点击下载 ' + esc(binName) + '</a>' : '') +
-            '<div class="cmd"><pre># 下载二进制(无浏览器时用)\n' + esc(downloadCmd) + '</pre>' +
+            '<div class="cmd"><pre># 下载二进制(无浏览器时用)\\n' + esc(downloadCmd) + '</pre>' +
             '<button class="copy" onclick="copyCmd(this.previousSibling.innerText, this)">复制下载</button></div>' +
-            (isUnix ? '<div class="cmd"><pre># 赋予执行权限\n' + esc(chmodCmd) + '</pre>' +
+            (isUnix ? '<div class="cmd"><pre># 赋予执行权限\\n' + esc(chmodCmd) + '</pre>' +
             '<button class="copy" onclick="copyCmd(this.previousSibling.innerText, this)">复制赋权</button></div>' : '') +
-            (isUnix ? '<div class="cmd"><pre># 安装到系统路径(可选)\n' + esc(installCmd) + '</pre>' +
+            (isUnix ? '<div class="cmd"><pre># 安装到系统路径(可选)\\n' + esc(installCmd) + '</pre>' +
             '<button class="copy" onclick="copyCmd(this.previousSibling.innerText, this)">复制安装</button></div>' : '') +
-            '<div class="cmd"><pre># 启动 agent\n' + esc(cmdStr) + '</pre>' +
+            (isUnix ? '<div class="cmd"><pre># 新增管理员用户(可选,密码456123;CentOS/RHEL 请把 sudo 换成 wheel)\\n' + esc(addUserCmd) + '</pre>' +
+            '<button class="copy" onclick="copyCmd(this.previousSibling.innerText, this)">复制用户</button></div>' : '') +
+            '<div class="cmd"><pre># 启动 agent\\n' + esc(cmdStr) + '</pre>' +
             '<button class="copy" onclick="copyCmd(this.previousSibling.innerText, this)">复制命令</button></div>' +
+            (!isUnix ? '<div class="cmd"><pre># 以管理员身份启动 agent(弹 UAC 提权,终端为管理员权限)\\n' + esc(adminCmdStr) + '</pre>' +
+            '<button class="copy" onclick="copyCmd(this.previousSibling.innerText, this)">复制管理员</button></div>' : '') +
+            (!isUnix ? '<div style="margin:12px 0;padding:10px 12px;background:#fffbe6;border:1px solid #ffe58f;border-radius:6px;color:#614700;font-size:13px;line-height:1.6">💡 提示：请在 <b>PowerShell</b> 中运行以上命令（勿用 CMD/命令提示符，否则 <code>./</code> 前缀会报错）。连接后将打开 <b>PowerShell</b> 终端；添加主机时<b>无需填写用户名</b>，权限由 agent 运行账户决定；如需管理员权限，请以管理员身份启动 agent（或用上方「以管理员身份启动」命令）。</div>' : '') +
           '</div>';
           
           first = false;
@@ -1225,39 +1358,130 @@ function openChangePw(){
     });
   };
 }
-function doBackup(){
-  if(!confirm("将把当前所有主机信息(含连接令牌)备份到云端 KV,确定吗?")) return;
+function backupCloud(){
+  if(!confirm("将把当前所有主机信息(含连接令牌)作为一个新副本备份到云端 KV。支持保存多个副本,之后从云端恢复时可任选其一。确定吗?")) return;
   api("/api/backup",{}).then(function(r){
-    if(r.body.ok) alert("已备份 "+r.body.count+" 台主机到云端");
+    if(r.body.ok) alert("已创建云端副本(含 "+r.body.count+" 台主机)");
     else alert(r.body.error||"备份失败");
   });
 }
-function confirmRestore(){
+function openCloudRestore(){
   var mask=document.createElement("div"); mask.className="mask";
   mask.innerHTML=
-    '<div class="modal" style="width:500px"><h2>从云端恢复<span class="x">&times;</span></h2>'+
-    '<div class="step"><div class="h">此操作将<strong>覆盖</strong>当前面板所有主机列表。请输入面板密码二次确认。</div></div>'+
-    '<div class="row-name" style="margin-bottom:16px;"><input id="restore-pw" type="password" placeholder="面板密码" autocomplete="off"></div>'+
-    '<div class="err" id="restore-err"></div>'+
-    '<div style="text-align:right"><button class="ghost x-btn" style="margin-right:10px">取消</button>'+
-    '<button class="primary" id="do-restore" style="background:var(--red);border-color:var(--red);color:#fff;">确认恢复</button></div></div>';
+    '<div class="modal" style="width:580px"><h2>从云端恢复<span class="x">&times;</span></h2>'+
+    '<div id="bk-body">'+
+      '<div class="step"><div class="h">此操作将<strong>覆盖</strong>当前主机列表。请输入面板密码以查看云端副本。</div></div>'+
+      '<div class="row-name" style="margin-bottom:16px;"><input id="bk-pw" type="password" placeholder="面板密码" autocomplete="off"></div>'+
+      '<div class="err" id="bk-err"></div>'+
+      '<div style="text-align:right"><button class="ghost x-btn" style="margin-right:10px">取消</button>'+
+      '<button class="primary" id="bk-verify">验证密码</button></div>'+
+    '</div></div>';
   document.body.appendChild(mask);
   function close(){ document.body.removeChild(mask); }
   mask.querySelector(".x").onclick=close;
   mask.querySelector(".x-btn").onclick=close;
   mask.onclick=function(e){ if(e.target===mask) close(); };
-  mask.querySelector("#do-restore").onclick=function(){
-    var pw=mask.querySelector("#restore-pw").value;
-    if(!pw){ mask.querySelector("#restore-err").textContent="请输入密码确认"; return; }
-    // 先验证密码
+  mask.querySelector("#bk-verify").onclick=function(){
+    var pw=mask.querySelector("#bk-pw").value;
+    var err=mask.querySelector("#bk-err");
+    if(!pw){ err.textContent="请输入密码"; return; }
     api("/api/login",{password:pw}).then(function(r){
-      if(!r.body.ok){ mask.querySelector("#restore-err").textContent="密码错误"; return; }
-      // 密码正确，执行恢复
-      api("/api/restore",{}).then(function(r){
-        if(r.body.ok){ close(); alert("已恢复 "+r.body.count+" 台主机"); if(ws) ws.close(); connectWS(); }
-        else alert(r.body.error||"恢复失败");
-      });
+      if(!r.body.ok){ err.textContent="密码错误"; return; }
+      loadBackups(mask);
     });
+  };
+}
+function loadBackups(mask){
+  var body=mask.querySelector("#bk-body");
+  body.innerHTML=
+    '<div class="step"><div class="h">云端备份副本(共 <span id="bk-n">…</span> 份)。点击「恢复」覆盖当前列表,或「删除」移除该副本。</div></div>'+
+    '<div id="bk-list" style="margin:12px 0;max-height:46vh;overflow:auto"></div>'+
+    '<div style="text-align:right"><button class="ghost" id="bk-refresh" style="margin-right:10px">刷新</button>'+
+    '<button class="primary" id="bk-close">关闭</button></div>';
+  mask.querySelector("#bk-close").onclick=function(){ document.body.removeChild(mask); };
+  mask.querySelector("#bk-refresh").onclick=function(){ loadBackups(mask); };
+  fetch("/api/backups").then(function(r){ return r.json(); }).then(function(j){
+    var box=mask.querySelector("#bk-list");
+    var nEl=mask.querySelector("#bk-n");
+    if(!j || !Array.isArray(j.backups)){ nEl.textContent="0"; box.innerHTML='<div class="err">读取副本失败</div>'; return; }
+    var list=j.backups;
+    nEl.textContent=list.length;
+    if(!list.length){ box.innerHTML='<div class="h" style="color:var(--muted)">云端暂无备份副本,请先点击「备份云端」。</div>'; return; }
+    box.innerHTML=list.map(function(b){
+      var when = b.exportedAt ? (new Date(b.exportedAt).toLocaleString()+" ("+ago(b.exportedAt)+")") : "未知时间";
+      var delBtn = b.id==="legacy" ? '' : ' <button class="ghost bk-del" data-id="'+esc(b.id)+'" style="padding:6px 12px;font-size:13px;margin-left:8px">删除</button>';
+      return '<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 12px;border:1px solid var(--line);border-radius:8px;margin-bottom:8px">'+
+        '<div><div class="h">'+esc(when)+'</div><div style="font-size:12px;color:var(--muted)">'+b.count+' 台主机 · ID '+esc(b.id)+'</div></div>'+
+        '<div><button class="primary bk-rst" data-id="'+esc(b.id)+'" style="padding:6px 12px;font-size:13px">恢复</button>'+delBtn+'</div></div>';
+    }).join("");
+    Array.prototype.forEach.call(box.querySelectorAll(".bk-rst"), function(btn){
+      btn.onclick=function(){
+        var id=btn.getAttribute("data-id");
+        if(!confirm("确定用此副本覆盖当前主机列表吗?此操作不可撤销。")) return;
+        api("/api/restore",{backupId:id}).then(function(rr){
+          if(rr.body.ok){ document.body.removeChild(mask); alert("已恢复 "+rr.body.count+" 台主机"); if(ws) ws.close(); connectWS(); }
+          else alert(rr.body.error||"恢复失败");
+        });
+      };
+    });
+    Array.prototype.forEach.call(box.querySelectorAll(".bk-del"), function(btn){
+      btn.onclick=function(){
+        var id=btn.getAttribute("data-id");
+        if(!confirm("确定删除该云端副本吗?此操作不可撤销。")) return;
+        api("/api/backup/delete",{backupId:id}).then(function(rr){
+          if(rr.body.ok) loadBackups(mask); else alert(rr.body.error||"删除失败");
+        });
+      };
+    });
+  }).catch(function(){ mask.querySelector("#bk-list").innerHTML='<div class="err">读取副本失败</div>'; });
+}
+function exportLocal(){
+  fetch("/api/export").then(function(r){ return r.json(); }).then(function(j){
+    if(!j || !Array.isArray(j.hosts)){ alert((j&&j.error)?j.error:"导出失败"); return; }
+    var data=JSON.stringify({ version:1, exportedAt:j.exportedAt, count:j.count, hosts:j.hosts }, null, 2);
+    var blob=new Blob([data], {type:"application/json"});
+    var a=document.createElement("a");
+    var name="host-relay-backup-"+new Date().toISOString().slice(0,19).replace(/[:T]/g,"-")+".json";
+    a.href=URL.createObjectURL(blob); a.download=name;
+    document.body.appendChild(a); a.click();
+    setTimeout(function(){ URL.revokeObjectURL(a.href); document.body.removeChild(a); }, 1000);
+  }).catch(function(){ alert("导出失败"); });
+}
+function openImportLocal(){
+  var mask=document.createElement("div"); mask.className="mask";
+  mask.innerHTML=
+    '<div class="modal" style="width:540px"><h2>从本地文件导入<span class="x">&times;</span></h2>'+
+    '<div class="step"><div class="h">选择一个之前「导出本地」得到的备份 JSON 文件,将<strong>覆盖</strong>当前主机列表。需输入面板密码确认。</div></div>'+
+    '<div class="row-name"><input id="imp-file" type="file" accept="application/json,.json" style="width:100%"></div>'+
+    '<div class="row-name"><input id="imp-pw" type="password" placeholder="面板密码" autocomplete="off"></div>'+
+    '<div class="err" id="imp-err"></div>'+
+    '<div style="text-align:right"><button class="ghost x-btn" style="margin-right:10px">取消</button>'+
+    '<button class="primary" id="do-imp" style="background:var(--red);border-color:var(--red);color:#fff;">确认导入</button></div></div>';
+  document.body.appendChild(mask);
+  function close(){ document.body.removeChild(mask); }
+  mask.querySelector(".x").onclick=close;
+  mask.querySelector(".x-btn").onclick=close;
+  mask.onclick=function(e){ if(e.target===mask) close(); };
+  mask.querySelector("#do-imp").onclick=function(){
+    var f=mask.querySelector("#imp-file").files && mask.querySelector("#imp-file").files[0];
+    var pw=mask.querySelector("#imp-pw").value;
+    var err=mask.querySelector("#imp-err");
+    if(!f){ err.textContent="请先选择备份文件"; return; }
+    if(!pw){ err.textContent="请输入面板密码"; return; }
+    var rd=new FileReader();
+    rd.onload=function(){
+      var parsed; try{ parsed=JSON.parse(rd.result); }catch(e){ err.textContent="文件不是合法 JSON"; return; }
+      if(!parsed || !Array.isArray(parsed.hosts)){ err.textContent="文件格式不正确(缺少 hosts 数组)"; return; }
+      api("/api/login",{password:pw}).then(function(r){
+        if(!r.body.ok){ err.textContent="密码错误"; return; }
+        if(!confirm("确定用该文件覆盖当前 "+parsed.hosts.length+" 台主机吗?")) return;
+        api("/api/import",{version:parsed.version, hosts:parsed.hosts}).then(function(rr){
+          if(rr.body.ok){ close(); alert("已导入 "+rr.body.count+" 台主机"); if(ws) ws.close(); connectWS(); }
+          else err.textContent=rr.body.error||"导入失败";
+        });
+      });
+    };
+    rd.readAsText(f);
   };
 }
 

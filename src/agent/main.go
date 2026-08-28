@@ -39,6 +39,7 @@ var (
 	hostID    = flag.String("id", "", "面板分配的主机 ID(必填)")
 	token     = flag.String("token", "", "面板生成的令牌(必填)")
 	shellPath = flag.String("shell", "", "本地 shell 路径(方案 B:agent 直接起此 shell,默认按 OS 选 /bin/bash 或 powershell)")
+	sshAddr   = flag.String("ssh-addr", "127.0.0.1:22", "SSH 桥接模式连接地址(默认本机 sshd);Windows 默认走 SSH,故该地址总生效")
 	interval  = flag.Duration("interval", 30*time.Second, "状态上报间隔")
 	diskPath  = flag.String("disk-path", defaultDiskPath(), "磁盘用量统计路径")
 	logFile   = flag.String("log", "", "指定日志文件路径,不指定则默认不保存日志文件")
@@ -81,6 +82,7 @@ type inMsg struct {
 	Username   string `json:"username"`
 	AuthType   string `json:"authType"`
 	Credential string `json:"credential"`
+	Shell      string `json:"shell"` // 起 shell 方式: 空/ powershell / cmd / ssh(Windows 默认走 ssh 经本机 sshd 拿真 PTY)
 	Cols       int    `json:"cols"`
 	Rows       int    `json:"rows"`
 }
@@ -373,7 +375,14 @@ func (c *conn) openShell(m inMsg) {
 		_ = c.writeJSON(outMsg{Type: "ssh_error", ChannelID: m.ChannelID, Msg: msg})
 	}
 
-	ptyFile, cleanup, err := startLocalShell(ctx, m, *shellPath)
+	// shell 选择优先级: 连接消息里的 m.Shell(前端下拉) > --shell 启动参数 > 按 OS 默认。
+	// Windows 默认走 "ssh"(经本机 OpenSSH.Server 的 sshd 拿真 PTY);
+	// 可选 "powershell" / "cmd"(普通管道,非交互); Linux 默认 /bin/bash。
+	shellChoice := m.Shell
+	if shellChoice == "" {
+		shellChoice = *shellPath
+	}
+	ptyFile, cleanup, err := startLocalShell(ctx, m, shellChoice)
 	if err != nil {
 		sendErr(friendlyShellError("启动 shell", err))
 		return

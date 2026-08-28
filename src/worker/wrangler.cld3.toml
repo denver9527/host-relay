@@ -1,0 +1,41 @@
+# 部署目标: cld3 账户 (cgq7139@163.com, acct 8c9d7df3008fed94fa98986c9f647280), zone sbot.cc.cd
+# 用法: CLOUDFLARE_EMAIL / CLOUDFLARE_API_KEY 注入凭据后 `npx wrangler deploy --config wrangler.cld3.toml`
+name = "host-relay"
+main = "worker.js"
+compatibility_date = "2026-05-18"
+account_id = "8c9d7df3008fed94fa98986c9f647280"
+
+workers_dev = true
+routes = [
+  { pattern = "host.sbot.cc.cd/*", zone_name = "sbot.cc.cd" }
+]
+
+[observability]
+enabled = true
+
+[[durable_objects.bindings]]
+name = "HUB"
+class_name = "Hub"
+
+[[durable_objects.bindings]]
+name = "HOST"
+class_name = "Host"
+
+# 面板密码哈希 + 主机备份(修改密码 / 一键备份云端 / 从云端恢复 用), 新建于 cld3 账户
+[[kv_namespaces]]
+binding = "RELAY_KV"
+id = "852ba8936a284f108929af30bf7820c0"
+
+# SQLite DO 类, 免费计划可用; 首次部署需 wrangler 应用此 migration
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Hub", "Host"]
+
+# 部署后配置以下 3 个 Secret(Dashboard -> Settings -> Variables & Secrets,类型选 Secret):
+#   ADMIN_PASSWORD   面板登录密码
+#   SESSION_SECRET   会话 cookie 签名密钥(随机长字符串)
+#   TICKET_KEY       SSH ticket 签名密钥(随机长字符串)
+# 或用命令逐个写入:
+#   npx wrangler secret put ADMIN_PASSWORD --config wrangler.cld3.toml
+#   npx wrangler secret put SESSION_SECRET --config wrangler.cld3.toml
+#   npx wrangler secret put TICKET_KEY   --config wrangler.cld3.toml

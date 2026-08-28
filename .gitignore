@@ -1,4 +1,5 @@
 .trae/
 src/agent/out/
+src/agent/agent.env
 .wrangler/
 .cursor/

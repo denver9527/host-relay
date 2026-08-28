@@ -35,6 +35,10 @@ func startLocalShell(ctx context.Context, m inMsg, shell string) (io.ReadWriteCl
 		// 降权后注入目标用户的 HOME/USER/SHELL,避免以目标用户身份却读到 /root 的 dotfiles(Permission denied)
 		baseEnv = append(baseEnv, "HOME="+home, "USER="+m.Username, "SHELL="+shell)
 		log.Printf("以用户 %s(uid=%d,home=%s) 起本地 shell: %s", m.Username, uid, home, shell)
+	} else if m.Username == "" {
+		// 空白用户名: 以 agent 当前用户身份起 shell(不做 setuid 降权)。
+		// Windows 端同样以当前用户运行; 这里保持一致, 使 Web UI 默认空白也能用。
+		log.Printf("以当前用户身份起本地 shell: %s", shell)
 	} else {
 		return nil, nil, fmt.Errorf("用户 %s 在服务器上不存在，拒绝起 shell", m.Username)
 	}

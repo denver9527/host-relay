@@ -25,8 +25,9 @@ const CLIENT_URL = {
 };
 
 const SESSION_TTL_MS   = 24 * 60 * 60 * 1000; // 会话有效期 24 小时(公共电脑风险更低, self-hosted 可接受)
-const LOGIN_MAX_FAILS  = 5;                    // 连续失败次数上限(爆破窗口更小)
-const LOGIN_LOCK_MS    = 30 * 60 * 1000;       // 锁定时长(30 分钟)
+const LOGIN_MAX_FAILS  = 5;                    // 连续失败次数上限
+const LOGIN_LOCK_MS    = 10 * 60 * 1000;       // 锁定时长(10 分钟)
+const LOGIN_WINDOW_MS  = 10 * 60 * 1000;       // 失败计数窗口:超过该时间未失败则重新计数
 const PENDING_TTL_MS   = 24 * 60 * 60 * 1000;      // pending 主机未上线清理阈值
 const CLEANUP_EVERY_MS = 6 * 60 * 60 * 1000;       // 清理任务间隔
 const TICKET_TTL_MS    = 5 * 60 * 1000;             // SSH ticket 有效期(5 分钟,避免开页久了点连接即失效)
@@ -220,6 +221,21 @@ export default {
 
       if (path === '/api/me' && request.method === 'GET') {
         return json({ authed: await isAuthed(request, env) });
+      }
+
+      if (path === '/api/clear-login-lock' && request.method === 'POST') {
+        const ip = clientIp(request);
+        const body = await request.json().catch(() => ({}));
+        const pwInput = typeof body.password === 'string' ? body.password : '';
+        const kvHash = env.RELAY_KV ? await env.RELAY_KV.get('admin:pwhash') : null;
+        const pwOk = kvHash
+          ? await verifyPassword(pwInput, kvHash)
+          : timingSafeEqual(pwInput, env.ADMIN_PASSWORD || DEFAULT_ADMIN_PASSWORD);
+        if (!pwOk) {
+          return json({ ok: false, error: '密码错误' }, { status: 401 });
+        }
+        await hub(env).loginReset(ip);
+        return json({ ok: true });
       }
 
       if (path === '/api/login' && request.method === 'POST') {
@@ -637,9 +653,12 @@ export class Hub extends DurableObject {
     return !!(r && r.lockUntil && r.lockUntil > Date.now());
   }
   async loginFail(ip) {
-    const r = this.sql.exec('SELECT fails FROM login_attempts WHERE ip = ?', ip).toArray()[0];
-    const fails = (r ? r.fails : 0) + 1;
-    const lockUntil = fails >= LOGIN_MAX_FAILS ? Date.now() + LOGIN_LOCK_MS : 0;
+    const now = Date.now();
+    const r = this.sql.exec('SELECT fails, lockUntil FROM login_attempts WHERE ip = ?', ip).toArray()[0];
+    // 如果上一条锁定已过期, 重新计数; 避免一次错误永久累计
+    const stale = !r || (r.lockUntil && r.lockUntil <= now);
+    const fails = stale ? 1 : (r.fails || 0) + 1;
+    const lockUntil = fails >= LOGIN_MAX_FAILS ? now + LOGIN_LOCK_MS : 0;
     this.sql.exec('INSERT INTO login_attempts(ip, fails, lockUntil) VALUES(?,?,?) ' +
       'ON CONFLICT(ip) DO UPDATE SET fails = ?, lockUntil = ?', ip, fails, lockUntil, fails, lockUntil);
   }
@@ -797,10 +816,15 @@ export class Host extends DurableObject {
       if (!agent) { this._sendBrowser(ws, { type: 'ssh_error', msg: '主机离线,无法连接' }); try { ws.close(); } catch {} return; }
       // 幂等:同一 cid 已有进行中的 ssh_open(定时器在跑)则忽略重复 auth,避免重复 open 覆盖 channel 造成孤儿 shell
       if (this._sshOpenTimers[att.cid]) return;
-      // 方案 B:relay 已鉴权,agent 直接以 username 起本地 shell,无需密码/私钥
+      // 方案 B:relay 已鉴权,agent 直接以 username 起本地 shell(或经 sshd 起真终端)。
+      // shell: powershell/cmd/ssh(空等同按 OS 默认); SSH 模式带 credential(密码)做 SSH 登录。
       try {
         agent.send(JSON.stringify({
-          type: 'ssh_open', channelId: att.cid, username: msg.username || 'root',
+          type: 'ssh_open', channelId: att.cid,
+          username: msg.username || '',
+          shell: msg.shell || '',
+          authType: msg.authType || (msg.shell === 'ssh' ? 'password' : ''),
+          credential: msg.credential || '',
           cols: msg.cols || 80, rows: msg.rows || 24,
         }));
       } catch {}
@@ -1004,6 +1028,16 @@ const PAGE_HTML = `<!DOCTYPE html>
   .row-name input{flex:1;padding:10px 12px;border-radius:8px;border:1px solid var(--line);
     background:var(--bg);color:var(--txt);font-size:14px}
   .row-name input:focus{outline:none;border-color:var(--signal)}
+  .pw-wrap{flex:1;position:relative;width:100%;box-sizing:border-box}
+  .pw-wrap input{width:100%;padding:10px 38px 10px 12px;border-radius:8px;border:1px solid var(--line);
+    background:var(--bg);color:var(--txt);font-size:14px;box-sizing:border-box}
+  .pw-wrap input:focus{outline:none;border-color:var(--signal)}
+  .pw-toggle{position:absolute;right:8px;top:50%;transform:translateY(-50%);background:transparent;border:none;
+    color:var(--muted);cursor:pointer;padding:4px;display:flex;align-items:center;justify-content:center;border-radius:4px}
+  .pw-toggle:hover{color:var(--txt);background:var(--line)}
+  .pw-toggle svg{display:block}
+  .box .pw-wrap input{border-color:#2a3441;background:#0e1116;color:#d6dee8;padding:10px 38px 10px 10px}
+  .box .pw-wrap input:focus{border-color:#3fd6c8}
 </style>
 </head>
 <body>
@@ -1039,14 +1073,27 @@ function renderLogin(errMsg){
     '<p>主机管理面板 · 请登录</p>'+
     '<div class="field"><input id="pw" type="password" placeholder="密码" autofocus></div>'+
     '<div class="err" id="le">'+esc(errMsg||"")+'</div>'+
-    '<button class="primary" id="lb" style="width:100%">登录</button></div>';
-  var pw=document.getElementById("pw"), lb=document.getElementById("lb");
+    '<button class="primary" id="lb" style="width:100%">登录</button>'+
+    '<button class="ghost" id="cl" style="width:100%;margin-top:8px;display:none">清除登录锁定</button></div>';
+  var pw=document.getElementById("pw"), lb=document.getElementById("lb"), cl=document.getElementById("cl");
   function go(){ lb.disabled=true;
     api("/api/login",{password:pw.value}).then(function(r){
       if(r.body.ok){ boot(); } else { lb.disabled=false;
-        document.getElementById("le").textContent=r.body.error||"登录失败"; pw.focus(); } });
+        document.getElementById("le").textContent=r.body.error||"登录失败";
+        // 被锁定时显示「清除锁定」按钮
+        if(r.status === 429 || (r.body.error && r.body.error.indexOf('频繁')>=0)){
+          cl.style.display='block';
+        }
+        pw.focus(); } });
   }
   lb.onclick=go; pw.onkeydown=function(e){ if(e.key==="Enter") go(); };
+  cl.onclick=function(){
+    cl.disabled=true;
+    api("/api/clear-login-lock",{password:pw.value}).then(function(r){
+      if(r.body.ok){ cl.style.display='none'; document.getElementById("le").textContent="已清除,请重新登录"; go(); }
+      else { cl.disabled=false; document.getElementById("le").textContent=r.body.error||"清除失败"; pw.focus(); }
+    });
+  };
 }
 
 // ---------------- 主面板 ----------------
@@ -1290,7 +1337,7 @@ function showEnroll(el, data){
             '<button class="copy" onclick="copyCmd(this.previousSibling.innerText, this)">复制命令</button></div>' +
             (!isUnix ? '<div class="cmd"><pre># 以管理员身份启动 agent(弹 UAC 提权,终端为管理员权限)\\n' + esc(adminCmdStr) + '</pre>' +
             '<button class="copy" onclick="copyCmd(this.previousSibling.innerText, this)">复制管理员</button></div>' : '') +
-            (!isUnix ? '<div style="margin:12px 0;padding:10px 12px;background:#fffbe6;border:1px solid #ffe58f;border-radius:6px;color:#614700;font-size:13px;line-height:1.6">💡 提示：请在 <b>PowerShell</b> 中运行以上命令（勿用 CMD/命令提示符，否则 <code>./</code> 前缀会报错）。连接后将打开 <b>PowerShell</b> 终端；添加主机时<b>无需填写用户名</b>，权限由 agent 运行账户决定；如需管理员权限，请以管理员身份启动 agent（或用上方「以管理员身份启动」命令）。</div>' : '') +
+            (!isUnix ? '<div style="margin:12px 0;padding:10px 12px;background:var(--panel-2);border:1px solid var(--line);border-radius:6px;color:var(--muted);font-size:13px;line-height:1.6">💡 提示：请在 <b>PowerShell</b> 中运行以上命令（勿用 CMD/命令提示符，否则 <code>./</code> 前缀会报错）。连接后将打开 <b>PowerShell</b> 终端；Windows 默认走 <b>SSH 真终端</b>，需本机已安装并开启 OpenSSH.Server（如未开启会自动回退到普通管道）。添加主机时<b>无需填写用户名</b>，权限由 agent 运行账户决定；如需管理员权限，请以管理员身份启动 agent。</div>' : '') +
           '</div>';
           
           first = false;
@@ -1364,11 +1411,17 @@ function regen(id){
 
 function openChangePw(){
   var mask=document.createElement("div"); mask.className="mask";
+  function eyeBtn(id){
+    return '<button type="button" class="pw-toggle" data-target="'+id+'" aria-label="显示密码">'+
+      '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" class="eye-open"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>'+
+      '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" class="eye-closed" style="display:none"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>'+
+    '</button>';
+  }
   mask.innerHTML=
     '<div class="modal"><h2>修改密码<span class="x">&times;</span></h2>'+
-    '<div class="row-name"><input id="opw" type="password" placeholder="原密码" autocomplete="off"></div>'+
-    '<div class="row-name"><input id="npw" type="password" placeholder="新密码(至少6位)" autocomplete="off"></div>'+
-    '<div class="row-name"><input id="npw2" type="password" placeholder="确认新密码" autocomplete="off"></div>'+
+    '<div class="row-name"><div class="pw-wrap"><input id="opw" type="password" placeholder="原密码" autocomplete="off">'+eyeBtn('opw')+'</div></div>'+
+    '<div class="row-name"><div class="pw-wrap"><input id="npw" type="password" placeholder="新密码(至少6位)" autocomplete="off">'+eyeBtn('npw')+'</div></div>'+
+    '<div class="row-name"><div class="pw-wrap"><input id="npw2" type="password" placeholder="确认新密码" autocomplete="off">'+eyeBtn('npw2')+'</div></div>'+
     '<div class="err" id="pw-err"></div>'+
     '<div style="text-align:right"><button class="ghost x-btn" style="margin-right:10px">取消</button>'+
     '<button class="primary" id="do-chpw">确认修改</button></div></div>';
@@ -1377,6 +1430,17 @@ function openChangePw(){
   mask.querySelector(".x").onclick=close;
   mask.querySelector(".x-btn").onclick=close;
   mask.onclick=function(e){ if(e.target===mask) close(); };
+  Array.prototype.forEach.call(mask.querySelectorAll('.pw-toggle'), function(btn){
+    btn.onclick = function(){
+      var input = mask.querySelector('#'+btn.getAttribute('data-target'));
+      var open = btn.querySelector('.eye-open'), closed = btn.querySelector('.eye-closed');
+      if(input.type === 'password'){
+        input.type = 'text'; open.style.display='none'; closed.style.display='inline-block';
+      } else {
+        input.type = 'password'; open.style.display='inline-block'; closed.style.display='none';
+      }
+    };
+  });
   mask.querySelector("#do-chpw").onclick=function(){
     var opw=mask.querySelector("#opw").value, npw=mask.querySelector("#npw").value, npw2=mask.querySelector("#npw2").value;
     var err=mask.querySelector("#pw-err");
@@ -1634,8 +1698,24 @@ const TERM_HTML = `<!DOCTYPE html>
 <div id="term"></div>
 <div class="overlay" id="ov"><div class="box">
   <h1>终端连接</h1>
-  <label>登录用户(将以该用户身份起本地 shell)</label>
-  <input type="text" id="user" value="root" autocomplete="off" spellcheck="false">
+  <label>起 shell 方式</label>
+  <div class="seg" id="shellseg">
+    <button data-shell="ssh" class="on">SSH 真终端</button>
+    <button data-shell="powershell">PowerShell</button>
+    <button data-shell="cmd">CMD</button>
+  </div>
+  <label>登录用户(默认 SSH 真终端必填,如 Administrator;PowerShell/CMD 管道可留空=当前用户)</label>
+  <input type="text" id="user" value="" autocomplete="off" spellcheck="false">
+  <div id="pwrow" style="">
+    <label>密码(SSH 登录凭据)</label>
+    <div class="pw-wrap">
+      <input type="password" id="pw" placeholder="密码" autocomplete="off" spellcheck="false">
+      <button type="button" class="pw-toggle" data-target="pw" aria-label="显示密码">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" class="eye-open"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" class="eye-closed" style="display:none"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+      </button>
+    </div>
+  </div>
   <button class="connect" id="go">连接</button>
   <div class="msg" id="msg"></div>
 </div></div>
@@ -1645,9 +1725,40 @@ const TERM_HTML = `<!DOCTYPE html>
 "use strict";
 var ticket = decodeURIComponent((location.hash||"").slice(1));
 var term, fit, ws, connected=false;
+var shellsel = "ssh";
 
 function setMsg(t){ document.getElementById("msg").textContent=t||""; }
 function btn(){ return document.getElementById("go"); }
+
+// shell 分段选择: SSH 模式需显示密码框
+(function(){
+  var seg = document.getElementById("shellseg");
+  seg.querySelectorAll("button").forEach(function(b){
+    b.onclick = function(){
+      seg.querySelectorAll("button").forEach(function(x){ x.className=""; });
+      b.className = "on";
+      shellsel = b.getAttribute("data-shell");
+      document.getElementById("pwrow").style.display = (shellsel==="ssh") ? "" : "none";
+    };
+  });
+})();
+
+// 密码可见性切换(SSH 登录框)
+(function(){
+  function bind(btn){
+    btn.onclick = function(){
+      var input = document.getElementById(btn.getAttribute('data-target'));
+      var open = btn.querySelector('.eye-open'), closed = btn.querySelector('.eye-closed');
+      if(!input || !open || !closed) return;
+      if(input.type === 'password'){
+        input.type = 'text'; open.style.display='none'; closed.style.display='inline-block';
+      } else {
+        input.type = 'password'; open.style.display='inline-block'; closed.style.display='none';
+      }
+    };
+  }
+  document.querySelectorAll('.pw-toggle').forEach(bind);
+})();
 
 function initTerm(){
   term = new Terminal({ cursorBlink:true, fontSize:13,
@@ -1667,11 +1778,16 @@ function doFit(){ if(!fit) return; try{ fit.fit(); }catch(e){}
 function connect(){
   if (location.protocol !== "https:" && location.hostname !== "localhost" && location.hostname !== "127.0.0.1") {
     setMsg("为了安全，Web SSH 必须在 HTTPS 环境下运行。正在跳转...");
-    location.href = "https:" + window.location.href.substring(window.location.protocol.length);
+    location.href = "https:" + window.location.href.substring(window.protocol.length);
     return;
   }
   setMsg("");
   if(!ticket){ setMsg("票据缺失,请从面板重新打开"); return; }
+  // SSH 模式: 用户名与密码必填
+  var user = document.getElementById("user").value.trim();
+  var pw = document.getElementById("pw").value;
+  if (shellsel === "ssh" && !user) { setMsg("SSH 模式需要填写登录用户名(如 Administrator)"); return; }
+  if (shellsel === "ssh" && !pw) { setMsg("SSH 模式需要填写登录密码"); return; }
   if(!term) initTerm();
   var proto = location.protocol==="https:"?"wss:":"ws:";
   ws = new WebSocket(proto+"//"+location.host+"/ws/ssh?ticket="+encodeURIComponent(ticket));
@@ -1679,7 +1795,10 @@ function connect(){
   btn().disabled=true;
   ws.onopen=function(){
     ws.send(JSON.stringify({ type:"auth",
-      username: document.getElementById("user").value || "root",
+      username: user,
+      shell: shellsel,
+      authType: shellsel==="ssh" ? "password" : "",
+      credential: shellsel==="ssh" ? pw : "",
       cols: term.cols, rows: term.rows }));
   };
   ws.onmessage=function(ev){

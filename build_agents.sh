@@ -53,8 +53,10 @@ echo "Version  : $VERSION (injected via ldflags)"
 for t in "${TARGETS[@]}"; do
   os="${t%%/*}"; rest="${t#*/}"
   arch="${rest%%/*}"; name="${rest#*/}"
+  # 注意: -o 必须用相对路径。绝对 POSIX 路径(/c/Users/...)传给 go.exe(Windows 程序)时
+  # Git Bash 不做路径转换,go 会把它解释成 C:\c\Users\... 静默写到错误目录!
   ( cd "$AGENT_DIR" && CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
-      "$GO_BIN" build -ldflags "$LDFLAGS" -o "$OUT/$name" . ) \
+      "$GO_BIN" build -ldflags "$LDFLAGS" -o "out/$name" . ) \
     && echo "OK   $os/$arch -> $name" \
     || { echo "FAIL $os/$arch"; exit 1; }
 done

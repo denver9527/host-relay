@@ -154,6 +154,16 @@ function json(data, init = {}) {
   });
 }
 
+// 页面响应统一附加安全响应头(防点击劫持/防 MIME 嗅探/不外泄 referrer)
+function htmlHeaders() {
+  return {
+    'Content-Type': 'text/html; charset=utf-8',
+    'X-Frame-Options': 'DENY',
+    'X-Content-Type-Options': 'nosniff',
+    'Referrer-Policy': 'no-referrer',
+  };
+}
+
 function clientIp(req) {
   return req.headers.get('CF-Connecting-IP') || req.headers.get('X-Forwarded-For') || 'unknown';
 }
@@ -207,11 +217,11 @@ export default {
 
       // ---- 页面 ----
       if (path === '/' && request.method === 'GET') {
-        return new Response(PAGE_HTML, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+        return new Response(PAGE_HTML, { headers: htmlHeaders() });
       }
       if (path === '/term' && request.method === 'GET') {
         if (!(await isAuthed(request, env))) return new Response('unauthorized', { status: 401 });
-        return new Response(TERM_HTML, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+        return new Response(TERM_HTML, { headers: htmlHeaders() });
       }
 
       // ---- API ----
@@ -225,6 +235,8 @@ export default {
 
       if (path === '/api/clear-login-lock' && request.method === 'POST') {
         const ip = clientIp(request);
+        const clFails = await hub(env).clearLockFails(ip);
+        if (clFails >= 10) return json({ ok: false, error: '尝试过于频繁,请稍后再试' }, { status: 429 });
         const body = await request.json().catch(() => ({}));
         const pwInput = typeof body.password === 'string' ? body.password : '';
         const kvHash = env.RELAY_KV ? await env.RELAY_KV.get('admin:pwhash') : null;
@@ -232,6 +244,7 @@ export default {
           ? await verifyPassword(pwInput, kvHash)
           : timingSafeEqual(pwInput, env.ADMIN_PASSWORD || DEFAULT_ADMIN_PASSWORD);
         if (!pwOk) {
+          await hub(env).clearLockFail(ip);
           return json({ ok: false, error: '密码错误' }, { status: 401 });
         }
         await hub(env).loginReset(ip);
@@ -610,7 +623,8 @@ export class Hub extends DurableObject {
          ON CONFLICT(hostId) DO UPDATE SET
            displayName=excluded.displayName, os=excluded.os, tokenHash=excluded.tokenHash,
            state=excluded.state, statusJson=excluded.statusJson, createdAt=excluded.createdAt`,
-        h.hostId, h.displayName || '', h.os || '', h.tokenHash || '', h.state || 'offline', 0,
+        h.hostId, h.displayName || '', h.os || '', h.tokenHash || '',
+        (h.state === 'active' || h.state === 'offline') ? h.state : 'offline', 0,
         h.statusJson || null, h.createdAt || Date.now());
       // 还原令牌到 Host DO,使已连 agent 用原 token 继续工作(恢复后旧 token 仍可用,无需重新生成)
       try { await this.env.HOST.getByName(h.hostId).provision(h.hostId, h.tokenHash); } catch {}
@@ -662,7 +676,23 @@ export class Hub extends DurableObject {
     this.sql.exec('INSERT INTO login_attempts(ip, fails, lockUntil) VALUES(?,?,?) ' +
       'ON CONFLICT(ip) DO UPDATE SET fails = ?, lockUntil = ?', ip, fails, lockUntil, fails, lockUntil);
   }
-  async loginReset(ip) { this.sql.exec('DELETE FROM login_attempts WHERE ip = ?', ip); }
+  async loginReset(ip) {
+    this.sql.exec('DELETE FROM login_attempts WHERE ip = ?', ip);
+    try { await this.ctx.storage.delete('clfail:' + ip); } catch {}
+  }
+
+  // ---------- 清锁接口防爆破(独立计数,不依赖登录锁定状态) ----------
+  // /api/clear-login-lock 需要验证密码但不受登录锁限制,若不设防会被当作
+  // 无限次密码猜测口。此处按 IP 计数:10 分钟窗口内错 10 次即拒绝,正确密码不受影响。
+  async clearLockFails(ip) {
+    return (await this.ctx.storage.get('clfail:' + ip)) || 0;
+  }
+  async clearLockFail(ip) {
+    const k = 'clfail:' + ip;
+    const n = ((await this.ctx.storage.get(k)) || 0) + 1;
+    await this.ctx.storage.put(k, n, { expirationTtl: 600 });
+    return n;
+  }
 
   // ---------- pending 清理 ----------
   async _ensureAlarm() {
@@ -1049,11 +1079,13 @@ var ws = null;
 var hosts = {};
 var uiState = { openIps: {} }; // 记录哪些主机的 IP 是展开状态的
 
-function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g,function(c){
-  return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c] || c; }); }
-function fmtBytes(n){ if(!n&&n!==0) return "-"; var u=["B","KB","MB","GB","TB"],i=0;
+function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g,function(c){
+  return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c] || c; }); }
+function fmtBytes(n){ if(n==null||n==="") return "-"; n=Number(n); if(!isFinite(n)||n<0) return "-";
+  var u=["B","KB","MB","GB","TB"],i=0;
   while(n>=1024&&i<u.length-1){n/=1024;i++;} return n.toFixed(n<10&&i>0?1:0)+u[i]; }
-function fmtUptime(s){ if(!s) return "-"; s=Math.floor(s); var d=Math.floor(s/86400);
+function fmtUptime(s){ if(s==null||s==="") return "-"; s=Math.floor(Number(s)); if(!isFinite(s)||s<=0) return "-";
+  var d=Math.floor(s/86400);
   var h=Math.floor((s%86400)/3600); var m=Math.floor((s%3600)/60);
   if(d>0) return d+"d "+h+"h"; if(h>0) return h+"h "+m+"m"; return m+"m"; }
 function ago(ts){ if(!ts) return "从未"; var s=Math.floor((Date.now()-ts)/1000);
@@ -1156,22 +1188,28 @@ function renderApp(){
 
 function renderList(){
   var list=document.getElementById("list"); if(!list) return;
-  var ids=Object.keys(hosts);
-  if(ids.length===0){ list.innerHTML='<div class="empty">还没有主机。点击「添加主机」生成客户端运行命令。</div>'; return; }
-  list.className="grid";
-  list.innerHTML=ids.map(function(id){ return cardHtml(hosts[id]); }).join("");
-  ids.forEach(function(id){
-    var del=document.getElementById("del-"+id), rg=document.getElementById("rg-"+id), mg=document.getElementById("mg-"+id);
-    var ipt=document.getElementById("ip-"+id);
-    if(del) del.onclick=function(){ confirmDelete(id); };
-    if(rg) rg.onclick=function(){ confirmRegen(id); };
-    if(mg) mg.onclick=function(){ openTerm(id); };
-    if(ipt) ipt.onclick=function(){ 
-      uiState.openIps[id] = !uiState.openIps[id]; // 切换持久化状态
-      var myCard = ipt.closest(".card");
-      if(myCard) myCard.classList.toggle("open-ips", uiState.openIps[id]);
-    };
-  });
+  try{
+    var ids=Object.keys(hosts);
+    if(ids.length===0){ list.innerHTML='<div class="empty">还没有主机。点击「添加主机」生成客户端运行命令。</div>'; return; }
+    list.className="grid";
+    list.innerHTML=ids.map(function(id){ return cardHtml(hosts[id]); }).join("");
+    ids.forEach(function(id){
+      var del=document.getElementById("del-"+id), rg=document.getElementById("rg-"+id), mg=document.getElementById("mg-"+id);
+      var ipt=document.getElementById("ip-"+id);
+      if(del) del.onclick=function(){ confirmDelete(id); };
+      if(rg) rg.onclick=function(){ confirmRegen(id); };
+      if(mg) mg.onclick=function(){ openTerm(id); };
+      if(ipt) ipt.onclick=function(){
+        uiState.openIps[id] = !uiState.openIps[id]; // 切换持久化状态
+        var myCard = ipt.closest(".card");
+        if(myCard) myCard.classList.toggle("open-ips", uiState.openIps[id]);
+      };
+    });
+  }catch(e){
+    // 单条脏数据不应让整个面板停摆:降级显示错误而不是白屏
+    list.className="";
+    list.innerHTML='<div class="empty">列表渲染出错: '+esc(String(e && e.message || e))+'</div>';
+  }
 }
 
 function confirmDelete(id) {
@@ -1250,13 +1288,15 @@ function cardHtml(h){
     '<div class="meta">'+esc(h.os||"-")+(s.hostname?' · '+esc(s.hostname):'')+' · '+esc(h.hostId)+'</div>';
   var body;
   if(on && h.status){
+    var cpuN = (s.cpu!=null && isFinite(Number(s.cpu))) ? Number(s.cpu) : null;
+    var loadN = (s.load1!=null && isFinite(Number(s.load1))) ? Number(s.load1) : null;
     var memPct = s.memTotal? (s.memUsed/s.memTotal*100):0;
     var diskPct = s.diskTotal? (s.diskUsed/s.diskTotal*100):0;
     body =
-      '<div class="metric"><div class="lbl"><span>CPU</span><b>'+(s.cpu!=null?s.cpu.toFixed(0):"-")+'%</b></div>'+bar(s.cpu)+'</div>'+
+      '<div class="metric"><div class="lbl"><span>CPU</span><b>'+(cpuN!=null?cpuN.toFixed(0):"-")+'%</b></div>'+bar(cpuN||0)+'</div>'+
       '<div class="metric"><div class="lbl"><span>内存</span><b>'+fmtBytes(s.memUsed)+' / '+fmtBytes(s.memTotal)+'</b></div>'+bar(memPct)+'</div>'+
       '<div class="metric"><div class="lbl"><span>磁盘</span><b>'+fmtBytes(s.diskUsed)+' / '+fmtBytes(s.diskTotal)+'</b></div>'+bar(diskPct)+'</div>'+
-      '<div class="metric"><div class="lbl"><span>运行</span><b>'+fmtUptime(s.uptime)+(s.load1!=null?'  ·  load '+s.load1.toFixed(2):'')+'</b></div></div>';
+      '<div class="metric"><div class="lbl"><span>运行</span><b>'+fmtUptime(s.uptime)+(loadN!=null?'  ·  load '+loadN.toFixed(2):'')+'</b></div></div>';
     
     if(s.publicIp || (s.localIps && s.localIps.length > 0)) {
       var pub = s.publicIp || "未知外网 IP";
@@ -1775,7 +1815,7 @@ function doFit(){ if(!fit) return; try{ fit.fit(); }catch(e){}
 function connect(){
   if (location.protocol !== "https:" && location.hostname !== "localhost" && location.hostname !== "127.0.0.1") {
     setMsg("为了安全，Web SSH 必须在 HTTPS 环境下运行。正在跳转...");
-    location.href = "https:" + window.location.href.substring(window.protocol.length);
+    location.href = "https:" + window.location.href.substring(window.location.protocol.length);
     return;
   }
   setMsg("");

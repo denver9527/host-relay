@@ -21,11 +21,21 @@ import (
 // username 用于 setuid 降权(需 agent 以 root 运行);无法解析或无权则回退当前用户。
 // 返回的 io.ReadWriteCloser 即 pty 主端,cleanup 负责回收进程。
 func startLocalShell(ctx context.Context, m inMsg, shell string) (io.ReadWriteCloser, func(), error) {
+	// Linux/macOS 没有"经本机 sshd 桥接"的语义(那是 Windows 专属)。
+	// 若前端/参数传来 "ssh",此处会误起 ssh 客户端而非本地 shell,统一回退默认 PTY shell。
+	if shell == "ssh" {
+		shell = ""
+	}
 	if shell == "" {
 		shell = defaultShell()
 	}
 	cmd := exec.CommandContext(ctx, shell, "-i")
-	baseEnv := []string{"TERM=xterm-256color"}
+	// 最小化环境(不透传 agent 自身环境变量给降权后的 shell),但 PATH 必须有:
+	// 交互 shell 的 rc 文件多数假定 PATH 已存在,缺失会导致 ls/sudo 等全部 command not found。
+	baseEnv := []string{
+		"TERM=xterm-256color",
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+	}
 
 	if uid, gid, home, ok := lookupUser(m.Username); ok {
 		cmd.SysProcAttr = &syscall.SysProcAttr{

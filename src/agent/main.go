@@ -392,8 +392,14 @@ func (c *conn) openShell(m inMsg) {
 	}
 
 	c.cmu.Lock()
-	c.chans[m.ChannelID] = &sshChan{pty: ptyFile, cancel: cancel}
+	old := c.chans[m.ChannelID]
+	sc := &sshChan{pty: ptyFile, cancel: cancel}
+	c.chans[m.ChannelID] = sc
 	c.cmu.Unlock()
+	// 同 cid 重复 ssh_open(异常重放场景):先取消旧会话,避免旧 shell 成为孤儿继续运行
+	if old != nil && old.cancel != nil {
+		old.cancel()
+	}
 
 	_ = c.writeJSON(outMsg{Type: "ssh_opened", ChannelID: m.ChannelID})
 
@@ -422,8 +428,11 @@ func (c *conn) openShell(m inMsg) {
 	go func() {
 		<-ctx.Done()
 		cleanup()
+		// 只在 map 里仍是本会话时才删除:若同 cid 已被新会话覆盖,不能误删新条目
 		c.cmu.Lock()
-		delete(c.chans, m.ChannelID)
+		if c.chans[m.ChannelID] == sc {
+			delete(c.chans, m.ChannelID)
+		}
 		c.cmu.Unlock()
 		log.Printf("channel %d shell 已结束,关闭 WS 通知浏览器", m.ChannelID)
 		_ = c.writeJSON(outMsg{Type: "ssh_close", ChannelID: m.ChannelID, Msg: "shell 已结束"})

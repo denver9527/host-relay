@@ -7,9 +7,11 @@ account_id = "41fd851aaccb6cb70f2cb9135265d5f9"
 
 # 测试部署目标: cld2 账户 (cgq7139@139.com), zone hi315.us.ci
 workers_dev = true
+# con.hi315.us.ci 用「自定义域(Custom Domain)」方式直连 worker，不走路由。
+# host-relay.hi315.us.ci 子域名已删除(路由+DNS 都已移除)。
+# custom_domain=true 需 token 具备 Zone:Workers Routes:Edit 权限(cfut_ 已具备)。
 routes = [
-  { pattern = "host-relay.hi315.us.ci/*", zone_name = "hi315.us.ci" },
-  { pattern = "con.hi315.us.ci/*", zone_name = "hi315.us.ci" }
+  { pattern = "con.hi315.us.ci", custom_domain = true }
 ]
 
 [observability]

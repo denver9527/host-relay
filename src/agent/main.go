@@ -32,7 +32,10 @@ import (
 	"github.com/shirou/gopsutil/v3/mem"
 )
 
-const version = "1.0.5"
+// 版本号单一真相源在仓库根的 version.txt。
+// 编译时由 build_agents.sh 通过 -ldflags "-X main.version=..." 注入,
+// 不可用 const(链接器 -X 只能覆盖 var)。默认 "dev" 仅作本地裸编兜底。
+var version = "dev"
 
 var (
 	server    = flag.String("server", "", "服务端地址,如 wss://host-relay.example.com(必填)")

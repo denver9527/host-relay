@@ -1315,7 +1315,7 @@ function showEnroll(el, data){
           var url = bins[binName];
           var cmdStr = "./" + binName + " --server " + data.serverUrl + " --id " + data.hostId + " --token " + data.token;
           var isUnix = (os !== 'win');
-          var downloadCmd = (os === 'win' ? 'curl -L -o "' + binName + '" "' + url + '"' : 'curl -L -o ' + binName + ' ' + url);
+          var downloadCmd = (os === 'win' ? 'curl.exe -L -o "' + binName + '" "' + url + '"' : 'curl -L -o ' + binName + ' ' + url);
           var chmodCmd = 'chmod 775 ./' + binName;
           var installCmd = 'sudo cp ./' + binName + ' /usr/local/bin/agent' + '\\n' + 'sudo chmod 755 /usr/local/bin/agent';
           var addUserCmd = "sudo useradd -m -s /bin/bash -G sudo user && echo 'user:456123' | sudo chpasswd";
@@ -1337,7 +1337,7 @@ function showEnroll(el, data){
             '<button class="copy" onclick="copyCmd(this.previousSibling.innerText, this)">复制命令</button></div>' +
             (!isUnix ? '<div class="cmd"><pre># 以管理员身份启动 agent(弹 UAC 提权,终端为管理员权限)\\n' + esc(adminCmdStr) + '</pre>' +
             '<button class="copy" onclick="copyCmd(this.previousSibling.innerText, this)">复制管理员</button></div>' : '') +
-            (!isUnix ? '<div style="margin:12px 0;padding:10px 12px;background:var(--panel-2);border:1px solid var(--line);border-radius:6px;color:var(--muted);font-size:13px;line-height:1.6">💡 提示：请在 <b>PowerShell</b> 中运行以上命令（勿用 CMD/命令提示符，否则 <code>./</code> 前缀会报错）。连接后将打开 <b>PowerShell</b> 终端；Windows 默认走 <b>SSH 真终端</b>，需本机已安装并开启 OpenSSH.Server（如未开启会自动回退到普通管道）。添加主机时<b>无需填写用户名</b>，权限由 agent 运行账户决定；如需管理员权限，请以管理员身份启动 agent。</div>' : '') +
+            (!isUnix ? '<div style="margin:12px 0;padding:10px 12px;background:var(--panel-2);border:1px solid var(--line);border-radius:6px;color:var(--muted);font-size:13px;line-height:1.6">💡 提示：请在 <b>PowerShell</b> 中运行以上命令（勿用 CMD/命令提示符，否则 <code>./</code> 前缀会报错）。连接后将打开 <b>PowerShell</b> 终端；Windows 默认走 <b>SSH 真终端</b>，需本机已安装并开启 OpenSSH.Server（如未开启会自动回退到普通管道）。若不想走 SSH 真终端，可在启动命令末尾追加参数切换：<code>--shell powershell</code> 走 PowerShell 普通管道，<code>--shell cmd</code> 走 CMD（默认留空即 SSH 真终端）。添加主机时<b>无需填写用户名</b>，权限由 agent 运行账户决定；如需管理员权限，请以管理员身份启动 agent。</div>' : '') +
           '</div>';
           
           first = false;

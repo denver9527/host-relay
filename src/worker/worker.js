@@ -5,7 +5,7 @@
 import { DurableObject } from 'cloudflare:workers';
 
 // ============================ 配置 ============================
-const VERSION = '1.0.5'; // 当前版本,CLIENT_URL 由此动态构建
+const VERSION = '1.0.6'; // 当前版本,CLIENT_URL 由此动态构建
 
 // 各平台客户端下载地址(自行替换为你发布的二进制地址,不替换则可以用这个默认的)。
 const CLIENT_URL = {

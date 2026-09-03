@@ -1741,8 +1741,9 @@ const TERM_HTML = `<!DOCTYPE html>
     <button data-shell="powershell">PowerShell</button>
     <button data-shell="cmd">CMD</button>
   </div>
-  <label>登录用户(默认 SSH 真终端必填,如 Administrator;PowerShell/CMD 管道可留空=当前用户)</label>
-  <input type="text" id="user" value="" autocomplete="off" spellcheck="false">
+  <label>登录用户(点选 root / Administrator,或自行输入;SSH 真终端必填,PowerShell/CMD 管道可留空=当前用户)</label>
+  <input type="text" id="user" value="root" list="user-suggestions" autocomplete="off" spellcheck="false" placeholder="点选 root / Administrator,或自行输入">
+  <datalist id="user-suggestions"><option value="root"></option><option value="Administrator"></option></datalist>
   <div id="pwrow" style="">
     <label>密码(SSH 登录凭据)</label>
     <div class="pw-wrap">

@@ -5,9 +5,12 @@ main = "worker.js"
 compatibility_date = "2026-05-18"
 account_id = "8c9d7df3008fed94fa98986c9f647280"
 
+# host.sbot.cc.cd 走「自定义域(Custom Domain)」方式直连 worker, 不走 Worker 路由。
+# 与线上现状保持一致(cf /accounts/*/workers/domains 里已是 host.sbot.cc.cd -> host-relay,
+# DNS 由 CF 托管为 AAAA 100::), 若改用 route 方式会与现存 Custom Domain 打架。
 workers_dev = true
 routes = [
-  { pattern = "host.sbot.cc.cd/*", zone_name = "sbot.cc.cd" }
+  { pattern = "host.sbot.cc.cd", custom_domain = true }
 ]
 
 [observability]
